@@ -1,0 +1,1622 @@
+# .NET Memory Performance Analysis
+
+###### **Know when to worry about it, and what to do if you need to worry about it**
+
+## **Purpose of this document**
+
+This document aims to help folks who develop applications in .NET with how to think about memory performance analysis and finding the right approaches to perform such analysis if they need to. In this context .NET includes .NET Framework and .NET Core. In order to get the latest memory improvements in both the garbage collector and the rest of the framework I strongly encourage you to be on .NET Core if you are not already, because that’s where the active development happens. 
+
+## **State of this document**
+
+This is a living document. Right now this document is mostly focusing on Windows. Adding the corresponding material for Linux would definitely make it more useful. I’m planning to do this in this future but contribution by other folks (especially to the Linux part) to the document would be most welcome.
+
+**Version revision history**
+
+| Version Number | Commit                                                       | Comment                                                      |
+| -------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| 1.0            | [c006800](https://github.com/Maoni0/mem-doc/commit/c006800d5173d8b4da60faebe94bc5b724f32cfd) | I did not maintain a version history before this but we will have a Chinese version checked in soon - in order to keep the 2 docs in sync we need to have a version history |
+|                |                                                              |                                                              |
+
+## **How to read this document**
+
+This is a long document but you don’t need to read all of it; you also don’t need to read sections in order. Depending on how experienced you are at doing perf analysis, some sections can be completely skipped. 
+
+:small_blue_diamond: If you are completely new to perf work, I would recommend to start at the beginning.
+
+:small_blue_diamond: For someone who's already comfortable doing perf work in general but wishes to increase their knowledge in managed memory related topics, they can skip the beginning and go directly to the [Fundamentals](#Memory-Fundamentals) section. 
+
+:small_blue_diamond: If you are not very experienced and doing a one off analysis, you could jump to the [Know when to worry](#Know-when-to-worry) section, read from there, and refer back to the [Fundamentals](#Memory-Fundamentals) section for specific topics if needed. 
+
+:small_blue_diamond: If you are a performance engineer whose job includes managed memory analysis as a regular task but is new to .NET, I would highly recommend you to really read and internalize the [GC Fundamentals](#GC-Fundamentals) section, because it will help you to focus on the right things much more quickly. However, if you have an urgent problem at hand, you could go to the [tool](#The-tool-we-use-and-how-it-does-its-job) I will be using in this doc, familiarize yourself with it, and then see if you can find the relevant symptom in either the [pause problems](#high--pause-time-in-gc) or the [heap size problems](#Large-GC-heap-size) sections.
+
+:small_blue_diamond: If you already have experience doing managed memory perf work and have a specific problem, you can find it either the [pause problems](#high--pause-time-in-gc) or the [heap size problems](#Large-GC-heap-size) sections. 
+
+**Note!**
+
+When I was writing this document I intended to introduce concepts like concurrent GC or pinning as needed by the explanation of the analysis. So as you read it, you'll gradually come across them. If you already kind of knew what they are and are looking for explanation on a specific concept here are the links to them -
+
+[Allocation Budget](#The-allocation-budget)
+
+[Concurrent GC/Background GC](#Concurrent-GCBackground-GC)
+
+[Finalizers](#Finalizers)
+
+[Generational GC](#The-effect-of-a-generational-GC)
+
+[LOH (Large Object Heap)](#LOH-Large-Object-Heap)
+
+[Pinning](#pinning)
+
+[Server GC](#Server-GC)
+
+## **Contents**
+
+**[How to think about performance work](#How-to-think-about-performance-work)**
+
+**[Picking the right approaches for doing performance analysis](#Picking-the-right-approaches-for-doing-performance-analysis)**
+
+:black_medium_square:[Know what your perf goal is](#Know-what-your-perf-goal-is)
+
+:black_medium_square:[Understand that GC is only one part of the framework](#Understand-that-GC-is-only-one-part-of-the-framework)
+
+:black_medium_square:[Don't guess, measure](#Dont-guess-measure)
+
+:black_medium_square:[Measure enough to know which area you should focus your effort on](#Measure-enough-to-know-which-area-you-should-focus-your-effort-on)
+
+:black_medium_square:[Measure the impact of factors that likely affect your perf metrics](#Measure-the-impact-of-factors-that-likely-affect-your-perf-metrics) 
+
+:black_medium_square:[Optimizing a framework vs user code](#Optimizing-a-framework-vs-user-code) 
+
+**[Memory Fundamentals](#Memory-Fundamentals)**
+
+:black_medium_square:[Virtual memory fundamentals](#Virtual-memory-fundamentals)
+
+:black_medium_square:[GC fundamentals](#GC-Fundamentals)
+
+:black_small_square:[Understanding the GC heap memory usage vs the process/machine memory usage](#Understanding-the-GC-heap-memory-usage-vs-the-processmachine-memory-usage)
+
+- [GC heap is only one kind of memory usage in your process](#GC-heap-is-only-one-kind-of-memory-usage-in-your-process)
+
+- [GC is per process but is aware of physical memory load on the machine](#GC-is-per-process-but-is-aware-of-physical-memory-load-on-the-machine)
+
+:black_small_square:[Understanding how GCs are triggered](#Understanding-how-GCs-are-triggered)
+
+- [GCs are triggered mostly due to allocations](#GCs-are-triggered-mostly-due-to-allocations)
+- [Other factors that would trigger GCs](#Other-factors-that-would-trigger-GCs)
+
+:black_small_square:[Understanding cost of allocations](#Understanding-cost-of-allocations)
+
+:black_small_square:[How to look at the GC heap size properly](#How-to-look-at-the-GC-heap-size-properly)
+
+- [Looking at the GC heap size wrt when GCs happen](#Looking-at-the-GC-heap-size-wrt-when-GCs-happen)
+- [The allocation budget](#The-allocation-budget)
+- [The effect of a generational GC](#The-effect-of-a-generational-GC)
+- [Fragmentation (free objects) is part of the heap size](#Fragmentation-free-objects-is-part-of-the-heap-size)
+- [GC's own bookkeeping](#GCs-own-bookkeeping)
+- [When would GC throw an OOM exception?](#When-would-GC-throw-an-OOM-exception)
+
+:black_small_square:[Understanding GC pauses, ie, when GCs are triggered and how long a GC lasts](#Understanding-GC-pauses-ie-when-GCs-are-triggered-and-how-long-a-GC-lasts)
+
+- [How long an individual GC lasts](#How-long-an-individual-GC-lasts)
+
+- [How often GCs are triggered](#How-often-GCs-are-triggered)
+
+- [The one rule to remember](#The-one-rule-to-remember)
+
+- [What makes an object survive](#What-makes-an-object-survive)
+
+  [1. The generational aspect](#1-The-generational-aspect)
+
+  [2. User roots](#2-User-roots)
+
+  [3. managed memory leaks](#3-managed-memory-leaks)
+
+- [“Mainline GC scenario” vs “not mainline”](#Mainline-GC-scenario-vs-not-mainline)
+
+- [Part of the GC pause that’s not doing GC at all – thread suspension](#Part-of-the-GC-pause-thats-not-doing-GC-at-all-–-thread-suspension)
+
+**[Know when to worry](#Know-when-to-worry)**
+
+:black_medium_square:[Top level application metrics](#Top-level-application-metrics)
+
+:black_medium_square:[Top level GC metrics](#Top-level-GC-metrics)
+
+:black_medium_square:[When to worry about GC](#When-to-worry-about-GC)
+
+**[Picking the right tools and interpreting the data](#Picking-the-right-tools-and-interpreting-the-data)**
+
+:black_medium_square:[The perf tooling landscape](#The-perf-tooling-landscape)
+
+:black_medium_square:[The tool we use and how it does its job](#The-tool-we-use-and-how-it-does-its-job)
+
+:black_medium_square:[How to start a memory perf analysis](#How-to-start-a-memory-perf-analysis)
+
+:black_medium_square:[How to collect top level GC metrics](#How-to-collect-top-level-GC-metrics)
+
+:black_medium_square:[Displaying top level GC metrics](#Displaying-top-level-GC-metrics)
+
+:black_medium_square:[Other relevant views in PerfView](#Other-relevant-views-in-PerfView)
+
+:black_medium_square:[High % Pause time in GC](#High--Pause-time-in-GC)
+
+:black_small_square:[Too many pauses, ie, too many GCs](#Too-many-pauses-ie-too-many-GCs)
+
+- [Measure allocations](#Measure-allocations)
+
+- [How to see why a GC decided to collect a generation](#How-to-see-why-a-GC-decided-to-collect-a-generation)
+
+:black_small_square:[Long individual pauses](#Long-individual-pauses)
+
+- [First of all, do you have a managed memory leak?](#First-of-all-do-you-have-a-managed-memory-leak)
+
+- [Are the long pauses due to ephemeral GCs, full blocking GCs or BGCs?](#Are-the-long-pauses-due-to-ephemeral-GCs-full-blocking-GCs-or-BGCs)
+
+- [Figuring out the amount of work for gen2 GCs](#Figuring-out-the-amount-of-work-for-gen2-GCs)
+
+- [Figuring out the amount of work for ephemeral GCs](#Figuring-out-the-amount-of-work-for-ephemeral-GCs)
+
+- [Figuring out if the long GCs are due to GC work or not](#Figuring-out-if-the-long-GCs-are-due-to-GC-work-or-not) 
+
+:black_medium_square:[Large GC heap size](#Large-GC-heap-size)
+
+- [Debugging OOM](#Debugging-OOM)
+- [Is the Peak size too large but the After size is not?](#Is-the-Peak-size-too-large-but-the-After-size-is-not)
+- [Is the After size too large?](#Is-the-After-size-too-large)
+- [Are you doing mostly BGCs for gen2 GCs?](#Are-you-doing-mostly-BGCs-for-gen2-GCs)
+- [Are you seeing a heap size that makes sense from GC’s POV, but still wanting to have a smaller heap?](#Are-you-seeing-a-heap-size-that-makes-sense-from-GCs-POV-but-still-wanting-to-have-a-smaller-heap)
+- [Is GC using too much memory for its own bookkeeping?](#Is-GC-using-too-much-memory-for-its-own-bookkeeping)
+
+**[Definitive signs of perf problems](#definitive-signs-of-perf-problems)**
+
+:black_medium_square:[Suspension is too long](#Suspension-is-too-long)
+
+:black_medium_square:[Random long GC pauses](#random-long-gc-pauses)
+
+:black_medium_square:[Most GCs are full blocking GCs](#most-gcs-are-full-blocking-gcs)
+
+**[Helpful info for us to help you debug perf issues](#helpful-info-for-us-to-help-you-debug-perf-issues)**
+
+:black_medium_square:[File version of the runtime](#file-version-of-the-runtime)
+
+:black_medium_square:[What diagnostics you have already performed](#what-diagnostics-you-have-already-performed)
+
+:black_medium_square:[Perf data](#perf-data)
+
+**[FAQ](#faq-1)**
+
+:black_medium_square:[I didn't change my code at all, why am I seeing a regression in memory when I upgrade my .NET version?](#faq-1)
+
+:black_medium_square:[Why isn't the GC collecting these objects? They should be collected!](#faq-2)
+
+:black_medium_square:[Why do *I* need to care about the OS differences at all? .NET is cross-plat so it should take care of that for me!](#faq-3)
+
+:black_medium_square:[We are collecting the % time in GC counter and it's telling us it's 99%. How do we fix our perf problem?](#faq-4)
+
+:black_medium_square:[What's the most efficient way for me to get help from you?](#faq-5)
+
+
+
+
+## **How to think about performance work**
+
+Those who are experienced in doing performance analysis know it can be like detective work – there’s no “If you follow these 10 steps you will improve perf or root cause a perf problem”. Why is this? Because your code is not the only thing running – you use the OS, the runtime, libraries (BCL at the minimum but often many others) to even run your own code. And the threads that run your code need to share the machine/VM/container with other threads in the same process and/or other processes.
+
+This however does not mean you need to have a thorough understanding of everything I just mentioned. Otherwise none of us will ever get anything done - you simply don’t have the time. But you don’t need to. You just need to understand enough fundamentals and acquire enough perf analysis skills so you can focus on the perf of your own code. In this document we’ll talk about both. I will also explain enough of the reasons why things work this way so it makes sense instead of having you memorize stuff which can easily be paged out. 
+
+This doc talks about what you can do on your side and when is a good time to hand over the analysis to the GC team as it would be an improvement that needs to happen in the runtime. Obviously, there's still work we are doing in GC to improve it (otherwise I wouldn't still be on this team). As we will see, the GC behavior is driven by your application behavior so you can definitely change your app behavior to influence the GC. There's a balance between how much work you need to do as a performance engineer and how much GC handles automatically. The philosophy of the .NET GC is we try to handle as much automatically as we can; and when we need your input (via configs) we will ask for it in a way that makes sense from the application perspective instead of requiring you to understand the intimate details of the GC. Of course the GC team is always working toward having the .NET GC handle more and more perf scenarios so the users need to worry less. But if you are running into a scenario that the GC doesn't currently handle well, I will point out what you can do to work around it. 
+
+My goal for perf analysis is to automate most of the kind of analysis customers need to do. We've come a long way for that but we are not at the point where all that is automated. In this doc I will tell you the current ways to do the analysis and at the end of the doc I will give you an outlook on what kind of improvements we are making toward reaching that goal. 
+
+## **Picking the right approaches for doing performance analysis**
+
+We all have limited amounts of resources and how to spend those on things that can yield the most return is the key. This means you should find which part is the most worthwhile to optimize and how to optimize them in the most efficient way. When you conclude you need to optimize something, or how you are going to optimize something, there should be a logical reason why you do so. 
+
+### **Know what your perf goal is**
+
+This is a question I always ask folks when they first come to me – what is your perf goal? Different products have very different perf requirements. Before you figure out a number (eg, improve something by X%), you need to know what you are optimizing for. At the top level these are the aspects to optimize for - 
+
+:black_medium_square: optimizing for memory footprint, eg, need to run as many instances on the same machine as possible
+
+:black_medium_square: optimizing for throughput, eg, need to process as many requests as possible during a certain amount of time
+
+:black_medium_square: optimizing for tail latency, eg, need to meet a certain SLA for latency
+
+Of course, you could have multiple of these, e.g. you might need to meet an SLA but still need to process at least a certain number of request during a time period. In this case you'll need to figure out what takes precedence which will determine what you should focus most of your effort on.
+
+### **Understand that GC is only one part of the framework**
+
+Changes in GC behavior can be due to GC changes or changes in the rest of the framework and there are usually a LOT of changes in the framework when you get a new release. When you see a memory behavioral change after upgrading, it could be due to GC changes or something else in the framework started to allocate more memory and survive memory differently. Additionally, if you upgrade your OS version or run your product in a different virtualized environment you can also get different behavior simply because they might cause your application to behave differently.
+
+### **Don't guess, measure**
+
+Being able to measure is something you should absolutely plan to do when you *start* a product, not as an after thought when something bad happens, especially if you know your product will need to run in quite stressful situations. If you are reading this doc, chances are you are working on something where perf matters.
+
+For most engineers I've worked with, measuring is really not a foreign concept. However, how and what to measure is something that I've seen many people needing help with.
+
+:black_medium_square: This means you need to have some way of measuring your perf realistically. A common problem with working on complex server apps is it's hard to simulate what you actually see on production in your test environment.
+
+:black_medium_square: Measuring doesn't just mean "I can measure how many requests my app can process per second because that's what I care about", it means you should also have something in place that allows you to do meaningful perf analysis when your measurements tell you something is not performing at a desirable level. Being able to discover problems is one thing. It's not very helpful if you don't have anything that helps you to figure out what causes these problems. Of course this requires you to know how to collect data which we will talk about below.
+
+:black_medium_square: Being able to measure effects from fixes/workarounds. 
+
+### Measure enough to know which area you should focus your effort on
+
+I've heard over and over again folks will measure one thing and choose to only optimize that thing because they heard about it somewhere from their friends or coworkers. This is where knowing the [fundamentals](#Memory-Fundamentals) really helps so you don't keep focusing on the one thing you heard about which may or may not be the right thing at all. 
+
+### **Measure the impact of factors that likely affect your perf metrics**
+
+After you know which factors might contribute the most perf wise to things you care about, i.e., your perf metrics, you should measure the *effect* of them so you can observe if they are contributing more or less as you develop your product. A perfect example is how server apps improve their P95 request latency (i.e., the 95th percentile request latency). This is a perf metric that pretty much every web server looks at. Of course any number of factors can affect this latency but you know the ones that likely contribute the most. 
+
+This is an illustration of 5 requests, R1 is affected by a GC and R4 is affected by a network IO. 
+
+<img src=".\request-latency.jpg" alt="request"/>
+
+Network IO is just an example of another factor that could contribute to your request latency. And box widths here are merely for illustration purpose.
+
+Your day to day (or whatever time unit you record P95 in) P95 latency could fluctuate but you know the ball park number. Let's say your average request latency is < 3ms and your P95 is around 70ms. You have to have some way to measure how long each request takes total (otherwise you wouldn't know your latency percentile). And you can record when you see a GC pause or a network IO (both can be measured via events). For requests that take around your P95 latency you can calculate "GC impact of P95" which is 
+
+`total GC pauses observed by those requests / total latency of those requests`
+
+If this is 10%, you know you have other factors unaccounted for. 
+
+Often folks would guess that GC pauses are what affect their P95 latency. Of course this is possible but it's by no means the only possible factor and the factor that affects your P95 the most. This is why it's important to understand the **impact** which tells you what you should spend most of your effort on.
+
+And factors that affect your P95 might be very different from the ones that affect your P99 or P99.99; the same principle applies to the other percentiles.
+
+### **Optimizing a framework vs user code**
+
+While this doc is for everyone who cares about memory analysis, different considerations should be made depending on which tier you are working on. 
+
+As someone who works on an end product, you have a lot of freedom to optimize as you can predict what kind of environments your product run in, e.g. in general you know which resource you tend to saturate, CPU, memory or something else. You have some control over what kind of machines/VMs your product runs on and what kind of libraries you use/how you use them. You could make estimates like "we have 128GB memory on the machine and plan to dedicate 20GB to an in-memory cache in our biggest process". 
+
+Folks who work on platform technologies or libraries can't predict what kind of environment their code will be running in. This implies 1) you need to be frugal about your memory usage if you want your users to be able to use your code on a perf critical path; 2) you might want to provide different APIs that make tradeoffs between performance and usability, and educate your users about it. 
+
+## **Memory fundamentals**
+
+As I mentioned above, it's completely unrealistic for one person to have thorough knowledge about the whole stack. This section lists fundamentals that are essential for anyone who needs to work on memory perf analysis to know.
+
+### **Virtual memory fundamentals**
+
+We use memory via the VMM (Virtual Memory Manager) which provides each process with its own virtual address space even though all processes on the same machine share the physical memory (and the page file if you have one). If you are running in a VM, the VM has the illusion of running on a machine. For applications, it's actually quite rare that you would work with even virtual memory directly. If you are writing native code usually you use the virtual address space via some native allocators like the CRT heap, or C++ new/delete helpers - these allocators will allocate and free virtual memory on your behalf; if you are writing managed code, GC is the one who allocates/frees virtual memory on your behalf.
+
+Each VA (Virtual Address) range (meaning a contiguous range of virtual addresses) can be in different states – free, reserved and committed. Free is easy. The difference between reserved and committed is what confused people sometimes. Reserved is saying “I want to make this region of memory available for my own use”. After you reserve a range of virtual addresses that range can not be used to satisfy other reserve requests. At this point you can not store any of your data in that range of addresses yet – to be able to do that you have to commit it, which means the system will have to back it up with some physical storage so you can store stuff in it. When you are looking at the memory via perf tools, make sure you are looking at the right things. You can get out of memory if you are running out space to reserve, or space to commit (I'm focusing on Windows VMM for this doc - in Linux you can get OOM (Out Of Memory) when you actually touch the memory). 
+
+Virtual memory can be private or shared. Private means it’s only used by the current process whereas shared means it can be shared by other processes. All GC related memory usage is private.
+
+Virtual address space can get fragmented – in other words, there can be “holes” (free blocks) in the address space. When you request to reserve a chunk of virtual memory, the VM manager needs to find one free block in the virtual address range that’s big enough to satisfy that request – if you only got a few free blocks whose sum is big enough it won’t work. This means even though you got 2GB, you don’t necessarily see all 2GB used. This was a severe problem when most apps were running as 32-bit processes. Today we have an ample virtual address range in 64-bit so physical memory is the main concern. When you commit memory, the VMM makes sure that you have enough physical storage should you actually want to touch that memory. When you actually write data into it, the VMM will now find a page (4 KB) into physical memory to store that data. This page is now part of your process's working set. And this is a very normal operation when you start your process. 
+
+When the processes on a machine are using more memory in aggregate than what the machine has, some pages will need to be written to the page file (if there is one which is the case most of the time). This is a very slow operation so it's common practice to try to avoid getting into paging. I'm simplifying this - the actual detail is not relevant to this discussion. While the process is in steady state usually you'd like to see that the pages that you actively use are kept in your working set so we don't need to pay any cost to bring them back in. In the next section we will talk about what GC does to avoid paging.
+
+I'm intentionally keeping this section short as GC is the one that needs to worry about interacting with virtual memory on your behalf but knowing a bit of fundamental helps with interpreting results from performance tools.
+
+### **GC Fundamentals**
+
+A garbage collector provides the great benefit of memory safety, frees developers from having to manually free memory, and saves possibly months or years of debugging heap corruption. And if you have had to debug heap corruptions you know how hard it can be. But it also presents challenges in memory performance analysis because GC doesn't run after each object dies (which would be incredibly inefficient) and the more sophisticated a GC is, the more consideration you have to take *if* you need to do memory analysis (you may or may not, we will get into that in the next section). This section is to establish some fundamental concepts to help you demystify enough of the .NET GC to know what the right approaches are when faced with memory investigations. 
+
+#### **Understanding the GC heap memory usage vs the process/machine memory usage**
+
+- ##### **GC heap is only one kind of memory usage in your process**
+
+In each process, every component that uses memory co-exists with each other. In any .NET process there's always some non GC heap memory usage, e.g., there are always modules loaded in your process that need to consume memory. But it's fair to say that for the majority of the .NET apps, this means the GC heap *for the most part*. 
+
+If the total private committed bytes (as mentioned above the GC heap is always in private memory) of a process is pretty close to your GC heap's committed bytes, you know most of it is due to the GC heap itself, so that's what you should focus on. If you do observe a significant discrepancy, that's when you should start to worry about looking into other memory usages in your process.
+
+- ##### **GC is per process but is aware of physical memory load on the machine**
+
+GC is a per process component (and always has been since the inception of the CLR). Most of the GC perf heuristics are based on per process measurements but GC is aware of the global physical memory load on the machine. We do this because we want to avoid getting into a paging situation. GC recognizes a certain memory load percentage as "high memory load situation". When the memory load percentage is over that, GC goes into a more aggressive mode, i.e., it would choose to do more full blocking GCs if it thinks they are productive because it wants to reduce the heap size. 
+
+Currently on smaller machines (ie, < 80 GiB memory), by default GC treats 90% as high memory load. On machines with more memory, this is between 90% and 97%. This threshold can be adjusted by the [COMPlus_GCHighMemPercent](https://docs.microsoft.com/en-us/dotnet/core/run-time-config/garbage-collector#high-memory-percent) environment variable (or System.GC.HighMemoryPercent config in runtimeconfig.json starting .NET 5). The main reason why you would want to adjust this is to control heap size. For example, on a machine with 64 GB memory, for the main dominant process it’s reasonable for GC to start reacting when there’s 10% memory available. But for smaller processes (for example, if a process only consumes 1 GB memory), GC can comfortably run with < 10% memory available so you might want to set it higher for those processes. On the other hand, if you want the larger processes to have smaller heap sizes (even when there’s a plenty of available physical memory on the machine), adjusting this lower would be an effective way for GC to react sooner to compact the heap down. 
+
+For processes running in a container, GC would consider the physical memory based on the container limit.
+
+[This section](#Figuring-out-the-amount-of-work-for-gen2-GCs) describes how to find out the memory load that each GC observed.
+
+#### **Understanding how GCs are triggered**
+
+So far we used GC to refer to the component. Below I will be using GC to either refer to the component or one or more occurances of the act of doing a collection to reclaim memory on the heap, i.e., a GC or GCs.
+
+- ##### **GCs are triggered mostly due to allocations**
+
+Since GC is supposed to manage allocations, naturally the predominant factor that would trigger a GC is due to allocations. As the process runs and allocations occur, GCs will be continuously triggered. We have a concept of an “allocation budget” which is the dominant factor that decides when a GC should be triggered. We will discuss the [allocation budget](#The-allocation-budget) in very much detail below.
+
+- ##### Other factors that would trigger GCs
+
+GCs can also be triggered due to the machine running into [high physical memory pressure](#GC-is-per-process-but-is-aware-of-physical-memory-load-on-the-machine) or if the user induces a GC themselves by calling `GC.Collect`. 
+
+#### **Understanding cost of allocations**
+
+Since most GCs are triggered due to allocations, it's worth understanding the cost of allocations. First of all, does an allocation have a cost when it doesn’t trigger a GC? The answer is absolutely. There’s code that needs to run to provide allocations – whenever you have to run code to do something, there’s a cost. It’s just a matter of how much. 
+
+The most expensive part of an allocation (without triggering a GC) is memory clearing. The GC maintains a contract that all allocations it hands out are zero filled. We do this for safety, security, and reliability reasons. 
+
+It’s common to hear folks talking about measuring GC cost but not so much about measuring allocation cost. One obvious reason is due to GCs interfering with your threads. It’s also the case that monitoring when GCs happen is very cheap - we provide lightweight tooling that tells you that. But allocations happen all the time and it’s difficult to monitor every time an allocation occurs – you’d incur so much overhead that would likely make your process no longer run in a meaningful state. We can measure allocation cost via the following appropriate ways and in the [Tools](#Measure-allocations) section we’ll see how to do them with various tooling techniques –
+
+##### 3 ways to look at allocations
+
+1) We can also measure how often GCs happen which tell us how much allocation happened. After all, most GCs are triggered due to allocations.
+
+2) One of the ways of profiling something that happens very frequently is sampling.
+
+3) When you have CPU usage info, you can look at cost in a GC method that does memory clearing. Actually looking up something by the method name is obviously very internal to GC and subject to implementation changes. But since this doc targets a wide range of engineers including experienced perf engineers, I will mention a few specific methods (whose names don’t tend to change much) as one way to do perf measurements.
+
+#### **How to look at the GC heap size properly**
+
+This sounds like a simple question. By measuring, right? Yes, but when you measure the GC heap matters a lot.
+
+- ##### **Looking at the GC heap size wrt when GCs happen**
+
+What does that even mean? Let's say we don't consider when GCs happen and just take a heap size measurement once every second. Take a look at the following (made up) example -
+
+Table 1
+
+| **Second** | **Action**                                      | **Heap size at the end** of that second |
+| ---------- | ----------------------------------------------- | --------------------------------------- |
+| 1          | allocated 1 GB                                   | 1 GB                                     |
+| 2          | allocated 2 GB                                   | 3 GB                                     |
+| 3          | allocated 0 GB                                  | 3 GB                                     |
+| 4          | GC happens(500 MB survives), then  allocated 1 GB | 1.5 GB                                   |
+| 5          | allocated 3 GB                                   | 4.5 GB                                   |
+
+We can say, yes, there was a GC that happened during second 4 because the heap size was smaller than second 3. But let's look at another possibility -
+
+Table 2
+
+| **Second** | **Action**                                    | **Heap size at the end** of that second |
+| ---------- | --------------------------------------------- | --------------------------------------- |
+| 1          | allocated 1 GB                                 | 1 GB                                     |
+| 2          | allocated 2 GB                                 | 3 GB                                     |
+| 3          | GC  happens(1 GB survives), then allocated 2 GB | 3 GB                                     |
+| 4          | allocated 1 GB                                 | 4 GB                                     |
+
+We can't say if a GC has happened if we just have the heap size data. 
+
+This is why it's important to measure the heap size w.r.t. when GCs happen. And naturally part of the perf data GC itself provides is exactly this - the heap size before and after each GC, IOW, on entry and exit of each GC (and a ton of other data as we will see later in this document). Unfortunately many memory tools, or diagnostics approaches I often see folks take, do not take this into consideration. The way they do memory diagnostics is “let me show you what the heap looks like at the point you happened to ask”. This is often not helpful and sometimes to the point that it’s completely misleading. This is not to say tools like these are not helpful at all – they can be helpful when the problem is simple. If you have a dramatic memory leak that’s been going on for a while and you used a tool that shows you the heap at that point (either by taking a process dump and using [SoS](https://docs.microsoft.com/en-us/dotnet/framework/tools/sos-dll-sos-debugging-extension), or by another tool that dumps the heap) it’s probably really obvious what the leak is. This is a common pattern in perf analysis - the more severe a problem is, the easier it is to figure it out. But when you have perf problems that are not this kind of low hanging fruit, these tools fall short.
+
+- ##### **The allocation budget**
+
+After reading the last paragraph, a simple way to think about allocation budget is the difference between the heap size on exit of the last GC and the heap size on entry of this GC. So the allocation budget is how much allocation GC allows before it triggers the next one. In Table 1 and Table 2, the allocation budget was the same - 3 GB. 
+
+However, due to the fact the .NET GC supports [pinning](#pinning) (which prevents GC from moving the object that's pinned) and the complications with pinning, the allocation budget is often not the difference between the 2 heap sizes. However, the idea of the budget being "the amount of allocations before the next GC is triggered" still holds true. We will talk more about pinning [later in this document](#pinning).
+
+One thing I’ve seen folks often do (or only do) when trying to improve memory performance is to reduce allocation. If you really could pre-allocate everything before the perf critical paths start, I say more power to you! However, that’s sometimes very impractical, for example, if you are using libraries, you don’t exactly have control over the allocations they do (of course you could try to find an allocation-less way to call an API but it’s not guaranteed there is one and their implementation could change). 
+
+So is reducing allocations a good thing? It is, as long as it would actually make a difference in your application performance and doesn’t make the logic in your code very awkward or complicated, to make it a worthwhile optimization. Would reducing allocation actually reduce perf? That all depends on how you are reducing allocation. Are you eliminating allocations or replacing them with something else? Because replacing allocations with something else may not reduce the amount of work the GC has to do.  
+
+- ##### **The effect of a generational GC**
+
+The .NET GC is [generational](https://en.wikipedia.org/wiki/Tracing_garbage_collection#Generational_GC_(ephemeral_GC)) with 3 generations, IOW, objects in the GC heap are divided into 3 generations; gen0 is the youngest generation and gen2 is the old generation. Gen1 acts as a buffer, usually for data still inflight in a request when a GC was triggered (so we hope that by the time we do a gen1 that data would not be referenced by your code). 
+
+By design, generational GCs don’t collect the whole heap every time a GC is triggered. They try to do young gen GCs much more often than old gen ones. Old gen GCs are often much more costly because they collect more of the heap.
+
+You’ve most likely heard of the term “GC pauses” before. GC pauses refers to when GC performs its work in the STW (Stop-The-World) fashion. With [concurrent GCs](#Concurrent-GCBackground-GC) which do most of the GC work concurrently with user threads, the GC pauses are not long but GC still needs to spend CPU cycles to do its job. Young gen GCs, i.e., gen0 and gen1 GCs, are called *ephemeral GCs* and old gen GCs, ie, gen2 GCs, are also referred to as *full GCs* because they collect the whole heap. When a genX GC happens, it collects genX and all its younger generations. So a gen1 GC collects both the gen0 and the gen1 portions of the heap.
+
+This also makes looking at the heap much more complicated because if you are fresh out of an old gen GC, especially a compacting one, you obviously have a potentially way smaller heap size than if you were right before that GC is triggered; but if you look at young gen GCs, they could be compacting but the difference in heap size isn’t as much and that’s by design.
+
+The allocation budget concept mentioned above is actually per generation so gen0, gen1 and gen2 each have their own allocation budget. User allocations will happen in gen0 and consume the gen0 allocation budget. When the allocations have consumed all of gen0's budget a GC will be triggered and the survivors of gen0 will consume gen1's allocation budget. By the same token, survivors of gen1 will consume gen2's budget. 
+
+Fig. 1 - objects going through GCs of different generations
+
+<img src=".\promotion-eph.jpg" alt="promote" style="zoom:80%;" />
+
+The difference between when an object "is dead" and when it's cleaned up is something that can be confusing. One of the FAQs I get is "I don't hold onto my object anymore, and I see GCs are happening, how come my object is still there?". Note that the fact an object is no longer held live by user code (in this document user code includes framework/library code, i.e., not GC code) needs to be discovered by the GC. An important rule to remember is "if an object is in genX, it means it can only possibly get reclaimed when a genX GC happens" because that's when GC would actually go check if objects in genX are still alive. If an object is in gen2, no matter how many ephemeral GCs happened that object will still be there because GC is simply not collecting gen2. Another way to think about this is the higher generation an object is in, the more work it takes the GC to collect.
+
+- ##### LOH (Large Object Heap)
+
+Now is a good time to talk about large objects, i.e., the **LOH** (Large Object Heap). So far we've mentioned gen0, gen1, and gen2 and that user code always allocates objects in gen0. This is actually not true if the objects are too large - they would be allocated in a different part of the heap, namely LOH. And gen0, gen1, and gen2 make up the **SOH** (Small Object Heap).
+
+In a way you could think of LOH as a way to discourage users from allocating large objects carelessly because larger objects can introduce perf challenges more easily than smaller ones. For example, when the runtime hands out an object by default it guarantees the memory is cleared. Memory clear is a costly operation and it's higher cost if we need to clear more memory. It's also harder to find spaces to fit a larger object. 
+
+The LOH is internally kept tracked as gen3 but logically it's part of gen2, meaning that the LOH is collected only during gen2 GCs. This means if you churn the LOH a lot you'd be triggering gen2 GCs very often and if your gen2 is also big that means GC will have to do a lot of work performing gen2 GCs.
+
+Like other generations, the LOH also has its allocation budget and when it’s exhausted, unlike for gen0, a gen2 GC will be triggered since the LOH is only cleaned up during gen2 GCs.
+
+By default the threshold for an object to get on the LOH to be >= 85000 bytes. This can be adjusted higher by using the [GCLOHThreshold](https://docs.microsoft.com/en-us/dotnet/core/run-time-config/garbage-collector#large-object-heap-threshold) config. The LOH is also [by default not compacted](https://docs.microsoft.com/en-us/dotnet/api/system.runtime.gcsettings.largeobjectheapcompactionmode?view=netcore-3.1) except when it’s running in a container with a memory limit (the container behavior was introduced in .NET Core 3.0).  
+
+- ##### **Fragmentation (free objects) is part of the heap size**
+
+Another FAQ is "I see a lot of free space in gen2, why isn't GC using this space?". 
+
+The answer is, GC is using that space. Again we have to come back to *when* you measure the heap size but now we need to add another dimension - compacting vs sweeping GCs.
+
+The .NET GC can perform either compacting or sweeping GCs. Compacting is the much more costly operation because the GC moves objects which means it has to update all the references of those objects on the heap, but compaction can reduce the heap size dramatically. Sweeping GCs do not compact but instead coalesce adjacent dead objects into a free object and thread these free objects onto the free list for that generation. The size the free list occupies, which we call fragmentation, is also part of the generation, therefore is included when we report the generation and heap sizes. Although the heap size doesn't change much in this case, the important thing to understand is this free list *is* used to accommodate survivors from the younger generation so we are using the free space. 
+
+Here we'll introduce another concept in GC - **concurrent** GC vs *blocking* GC. 
+
+###### Concurrent GC/Background GC
+
+We know that a full GC may take a long time if we did it in a stop-the-world fashion - what we call a full blocking GC. We don't want to have to pause the user threads for that long so most of the time, a full GC is done concurrently, meaning the GC threads run concurrently with the user threads, for the most part in that GC (a concurrent GC still needs to pause user threads but only for a short amount of time). The current concurrent GC flavor in .NET is called *Background GC, or BGC* for short. And BGCs only sweep. IOW, the job of a BGC is to build up a gen2 free list to accommodate gen1 survivors. Ephemeral GCs are always done as blocking GCs because they are short enough. 
+
+Now let's think about the "when to measure" problem again. When we do a BGC, at the end of that GC, a fresh free list is built up. As gen1 GCs run, they will be using part of this free list to accommodate their survivors so the list size will become smaller and smaller. So when you say "I see a lot of free space in gen2", if that's when a BGC just happened, or just happened not long ago, it would be normal. It's a real perf problem if by the time we do the next BGC, there's always a lot of free space in gen2, which means we did all that work to build up a free list, but it didn't get used much. I have seen this in some scenarios and we are building a solution that allows us to do optimal BGC triggering.
+
+Pinning again adds complexity to fragmentation which we will talk about in the [pinning section](#pinning).
+
+- ##### Physical representation of the GC heap
+
+We've been talking about measuring the GC heap size properly but what does a GC heap actually look like in memory, ie, how is the GC heap physically organized? 
+
+GC acquires and releases virtual memory like any other Win32 applications with the `VirtualAlloc` and `VirtualFree` APIs (on Linux this is done via `mmap`/`munmap`). The operations that GC performs with virtual memory are the following -
+
+When the GC heap is initialized, it reserves an initial segment for the SOH and another one for the LOH, and only commits a couple of pages at the beginning of each segment to store some initial info.
+
+As allocations happen on this segment, memory is committed as needed. For the SOH, since there's only one segment, gen0, gen1 and gen2 live on this segment at this point. An invariant to keep in mind is both ephemeral generations, ie, gen0 and gen1, always live on the same segment which is called the ephemeral segment, which means the combined ephemeral generations will never be bigger than a single segment. If the SOH grows bigger than what the one segment can hold, a new segment will be acquired during a GC. The segment gen0 and gen1 are on is the new ephemeral segment and the other one now becomes a gen2 segment. This is done during a GC. The LOH is different since user allocations go into the LOH, new segments are acquired during allocation time. So a GC heap might look like this (there might be unused space at the end of segments which is denoted by white space):
+
+Fig. 2 - GC heap segments 
+
+<img src=".\segments.jpg" alt="segments" style="zoom:80%;" />
+
+
+
+As GCs happen and reclaim memory, segments are released when no live objects are discovered on them; the end of the segment space (i.e., the end of last live object on the segment till end of the segment) is decommitted except for the ephemeral segment.
+
+###### Special handling of the ephemeral segment
+
+For the ephemeral segment we keep the space after the last live object committed after a GC because we know gen0 allocations will be using this space right away. And since the amount of memory we'll be allocating is the gen0 budget, the amount of the committed space is the gen0 budget. This answers another FAQ - "Why does the GC commit more memory than the heap size?". This is because the committed bytes include this gen0 budget part, whereas if you happen to look at the heap shortly after a GC happens, it hasn't consumed most of this space yet. Especially is the case when you have [Server GC](#Server-GC) which can have a pretty large gen0 budget; it means this difference can be large, e.g., if there are 32 heaps and each heap has a 50 MB gen0 budget and you look at the heap size right after a GC, the size you see is going to be (32 * 50 = 1.6 GB) less than the committed bytes. 
+
+Note that in .NET 5 the decommit behavior changed such that we can leave a bit more memory committed because we want to take gen1 into GC consideration as well. Also the decommit for Server GC is now done outside of the GC pause so part of what reported at the end of the GC may be decommitted. This is an implementation detail - using the gen0 budget is still generally a very good approximation for determining how much the committed part is.
+
+Going with the above example, after a gen2 GC, the heap might look like this (note this is merely an example illustration):
+
+Fig. 3 - GC heap segments after a gen2 GC
+
+<img src=".\segments-after-gen2.jpg" alt="segments" style="zoom:80%;" />
+
+After a gen0 GC, since it can only collect the gen0 space, we might see this:
+
+Fig. 4 - GC heap segments after a gen0 GC
+
+<img src=".\segments-after-gen0.jpg" alt="segments" style="zoom:80%;" />
+
+Most of the time you don't have to be concerned with the fact the GC heap is organized into segments except on 32-bit since the virtual address space is small (2-4 GB total) and can be fragmented, even when you are asking for a small object you may get an OOM because we need to reserve a new segment but can't. On 64-bit, which most of our customers are on these days, there's plenty of virtual address space so reserving is not a problem. And on 64-bit platforms, segment sizes are much larger.
+
+- ##### **GC's own bookkeeping**
+
+Obviously, GC also needs to do its own bookkeeping and that has to consume memory - this is roughly 1% of the GC heap size. The biggest consumption is due to having [concurrent GC](#Concurrent-GCBackground-GC) enabled which is the default. To be accurate, the concurrent GC bookkeeping is proportional to the heap reserve size but the rest of the bookkeeping is actually proportional to the heap range. Since this is 1%, the likelihood that you'll need to care about it is extremely low. 
+
+- ##### When would GC throw an OOM exception?
+
+Almost everyone has heard about or encountered the OOM exception. When would GC actually throw an OOM exception? The GC does try very hard before an OOM is thrown. Since GC mostly does ephemeral GCs, it means the heap size often isn't at its smallest, by design. However, GC does in general try a full blocking GC and verifies it still cannot satisfy the allocation request, before it throws an OOM. There is an exception to this which is GC has a tuning heuristic that says it does not continue to try full blocking GCs if they are not effective at shrinking the heap size. It will try some gen1 GCs intermixed with full blocking GCs. So you might see an OOM throw but the GC that threw it wasn't a full blocking GC. 
+
+#### **Understanding GC pauses, i.e., when GCs are triggered and how long a GC lasts**
+
+When folks investigate GC pause issues, I always ask them if they care about total pause and/or individual pause. Total pause is indicated by "% pause time in GC", each time a GC is triggered, the pause is added to the total pause. Usually you care about this for throughput reasons as you don't want GC to pause your code too much that it reduces the throughput to an acceptable point. Individual pause indicates how long *a single* GC lasts. Aside from being part of the total pause, one reason why you'd care about individual pauses is usually for request tail latency - you'd want to reduce long GCs to eliminate or reduce their impact to your tail latency.
+
+- ##### **How long an individual GC lasts**
+
+The .NET GC is a tracing GC, which means GC needs to go trace through various kinds of *roots* (e.g., stack locals, GC handle table) to find out which objects should be *live*. So the amount of GC work is proportional to how much memory is live, i.e., the survivors. How long a GC lasts is *roughly* proportional to the amount of GC work. We'll talk about roots more later in this doc.
+
+For blocking GCs, since they pause the user threads for the whole duration of the GC, how long a GC lasts is the same as how long the GC pause is. For BGCs, they could last for quite some time but the pause time is much smaller since GC does it work mostly concurrently.
+
+Notice I said how long a GC lasts is *roughly* proportional to the amount of GC work. Why roughly? GC needs to share the cores on the machines like everything else. For blocking GCs, when we say "GC pauses the user threads" we really meant "threads executing managed code". Threads executing native code are free to run (although need to wait for GC to finish if they need to return to managed code while GC is still going on). Lastly, don't forget that other processes that are running while threads are paused in your process due to GC. 
+
+This is where we introduce another concept which is the different major flavors of the GC - *Workstation GC* vs ***Server GC\*** (WKS GC vs SVR GC for short). 
+
+###### Server GC
+
+As the name suggests they are for workstation (i.e., client) and server workloads respectively. Workstation workload implies you share the machine with many other processes whereas server workload *usually* means it's the dominant process on the machine and tends to have many users threads working in the process. The major difference between these 2 GC flavors is WKS GC has one heap and SVR GC has as many heaps as there are logical cores on the machine, with the same # of GC threads doing GC work. All the concepts we’ve introduced so far apply to each heap, for example, [the allocation budget](#The-allocation-budget) is now per generation per heap so each heap has its own gen0 budget. When any heap’s gen0 allocation budget is exhausted, a GC is triggered. The GC heap segments pictured above would be repeated per heap (although they might contain different amounts of memory on them). 
+
+Due to the different nature of the 2 kinds of workloads, SVR GC has 2 distinctly different attributes that WKS GC does not have -
+
+1) SVR GC threads' priority is set to `THREAD_PRIORITY_HIGHEST` which means it would preempt other threads if they were lower priority, which most theads are. In comparison, WKS GC runs the GC work on the user thread that triggered the GC so it's whatever priority that thread runs at which is usually normal priority.
+
+2) SVR GC threads are hard affinitized to logical cores. 
+
+See the MSDN doc for [an illustration](https://docs.microsoft.com/en-us/dotnet/standard/garbage-collection/workstation-server-gc) of SVR GC. And since we now talked about both Server and [Concurrent/Background GC](#Concurrent-GCBackground-GC), you might ask do Server GC also have the concurrent flavor? The answer is yes. And again, I will refer you to the [MSDN doc](https://docs.microsoft.com/en-us/dotnet/standard/garbage-collection/background-gc) for it as it has a clear illustration of Background WKS GC vs Background SVR GC.
+
+The reason why we do this is when a SVR GC happens we want it to be able to do its work as quickly as possible. While this does achieve that goal most of the time, it can introduce a perf complication that you should watch out for - if there are other threads also running at `THREAD_PRIORITY_HIGHEST` or higher at the same time a SVR GC is happening, they will cause SVR GC to take longer because each GC thread only runs on its respective core (we will see how to diagnose long GCs in [a later section](#PerfView-GC-stop-triggers)). And this is usually very rare but there's a caveat which is when you have multiple processes on the same machine that use SVR GC. This was a rare situation in the early days of the runtime but as it became less rare, we created some configs that allow you to specify fewer GC heaps/threads for a process using SVR GC. These configs are explained [here](https://devblogs.microsoft.com/dotnet/middle-ground-between-server-and-workstation-gc/). 
+
+I have seen folks intentionally divide up one big server process into multiple smaller processes so each process would have a smaller heap by using Server GC with a smaller heap count. And they achieved better perf that way (a smaller heap mean shorter pause time if it does need to do full blocking GCs). This is a valid approach but of course only use it if it makes sense - for some applications it's very awkward to split one process into multiple.
+
+- ##### **How often GCs are triggered**
+
+As mentioned earlier, a GC is triggered when the gen0 allocation budget is exhausted. When a GC is triggered, the first step that happens is we decide what generation this GC is going to be. In the tooling section we will see what reasons would cause GC to escalate from gen0 to possible gen1 or gen2, but one of the main factors there is the allocation budget of gen1 and gen2. If we detect gen2's allocation budget is exhausted we would escalate this GC to a full GC. 
+
+So the answer to "how often GCs are triggered" is it's determined by how often gen0/LOH budgets are exhausted, and how often a gen1 or gen2 GC is triggered is mostly determined by how often gen1's and gen2's budgets are exhausted. Naturally you'd ask "how are budgets calculated then?". Budgets are calculated mostly based on how much survival we see from that generation. The higher the survival rate is the bigger the budget is. If GC collects a generation and discovers most objects survived, it wouldn't make sense to collect it so soon again because the goal of a GC is to reclaim memory. If GC did all this work and very little memory can be reclaimed, it would be very inefficient. 
+
+How this translates to how often GCs are triggered is if a generation is churned a lot (i.e., its survival rate is low), it would get collected more often. This explains why we collect gen0 the most often because gen0 is for very temporary objects and its survival rate is very low. Based on the generational hypothesis which says objects either tend to live for a very long time or be very temporary, gen2 holds long lived objects so they get collected the least often.
+
+As mentioned before, in [high memory load](#GC-is-per-process-but-is-aware-of-physical-memory-load-on-the-machine) situations we are more aggressive at triggering gen2 blocking GCs. When the memory load is high, we tend to do full blocking GCs instead so we can compact. While BGC is good for pause time, it isn't good for shrinking the heap which is more important when GC thinks it's short on memory. 
+
+Another reason for us to do full blocking GCs when the memory load isn’t high is when the gen2 fragmentation is very high and GC sees it as productive to dramatically reduce the heap size. If this is unnecessary for you (ie you have plenty of available memory) and you’d rather avoid the long pause, you can set the latency mode to [SustainedLowLatency](https://docs.microsoft.com/en-us/dotnet/api/system.runtime.gclatencymode?view=netcore-3.1#System_Runtime_GCLatencyMode_SustainedLowLatency) to tell GC to only do full blocking GCs when it has to.
+
+- ##### **The one rule to remember**
+
+That was a lot of material but if we summarize it to one rule, this is what I always tell folks when talking about how often GCs are triggered and how long individual GCs last is 
+
+`What survives usually determines how much work GC needs to do; what doesn't survive usually determines how often a GC is triggered.`
+
+Here are some extreme examples when we apply this rule -
+
+Scenario 1 - gen0 doesn't survive at all. This means gen0 GCs are triggered very often. But individual gen0 pauses are very short because there's basically no work to do. 
+
+Scenario 2 - most of the gen2 survives. This means gen2 GCs are triggered very infrequently. But individual gen2 pauses, if done as a blocking GC, would be very long; if done as a BGC, it would last for a long time (but the pauses are still short).
+
+You cannot be in a situation that both your allocation rate and survival rate are very high – you’d just run out of memory very quickly. 
+
+- ##### **What makes an object survive**
+
+From GC's POV, it gets told which objects should survive by various runtime components. It doesn't care what types these objects are; it just cares how much memory survives and whether these objects have references because it'd need to trace through these references to reach the child objects that should also survive. We are always making improvements in GC itself to improve GC pauses, but as someone who writes managed code, knowing what makes objects survive is an important way via which you could improve individual GC pauses on your side.
+
+###### 1. The generational aspect
+
+We already talked about the effect of a generation GC so the first rule is 
+
+`When a generation isn't collected, it means all objects in that generation are live`
+
+So if we are collecting gen2, the generational aspect is irrelevant because all generations are getting collected. A FAQ I get is “I already call GC.Collect() multiple times and the object is still there, why isn’t GC getting rid of it??”. This is because when you induce a full blocking GC, GC does not participate in determining what objects should be live – it only gets told by the [user roots](#2-User-roots) (stack/GC handles/etc) that we’ll talk about below. So that means whatever is still alive *IS* because it needs to be live and GC simply cannot reclaim it.
+
+Unfortunately very few perf tools highlight the generational effect even though that's a cornerstone of the .NET GC. Many perf tools will give you a heap dump - some will tell you which stack variables or which GC handles hold onto objects. You could be getting rid of a big percentage of your GC handles and see virtually no improvement of your GC pause time. Why? If most of your GC pauses are from gen0 GCs due to them being held live by some objects in gen2, it wouldn't help if you manage to get rid of some gen2 objects that don't hold these gen0 objects live anyway. Yes it would reduce gen2 work but if gen2 GCs occur very infrequently it wouldn't make much difference and nd if your goal is to reduce the number of gen2 GCs, you wouldn’t have made much progress.
+
+###### 2. User roots
+
+The common type of roots you have most likely heard are stack variables that point to objects, GC handles and finalize queue. I call these user roots because they are from user code. Since these are something user code can directly affect I will talk about them in detail. 
+
+- Stack variables
+
+
+Stack variables, especially for C# programs, are actually not talked about very much. The reason is that JIT also does a good job realizing when a stack variable is no longer in use. When a method is done, a stack root is guaranteed to disappear. But even before that, JIT can also figure out when a stack var isn't needed anymore so will not report to GC, even when a GC happens in the middle of a method. Note that it is not the case in DEBUG builds. 
+
+- GC handles​​
+
+
+GC handles are a way for user code to either hold an object live, or inspect an object without holding it live. The former is called a strong handle and the latter is called a weak handle. Strong handles need to be freed in order for it to no longer hold an object live, ie, you need to call Free on the handle. I've had folks who showed me the output of !gcroot (an SoS debugger extension command that shows you the root of an object) that says a strong handle pointing to an object and asked me why GC hasn't reclaimed that object. By design this handle tells the GC that object needs to be live so GC can't reclaim it. Currently the following [user exposed handle types](https://docs.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.gchandletype?view=netcore-3.1) are strong handles: Strong and Pinned; and weak handles are Weak and WeakTrackResurrection. But if you have seen SoS's !gchandles output, pinned handles can also include AsyncPinned.
+
+###### Pinning
+
+I have mentioned pinning a couple of times above. Most people know what pinning is - it indicates to the GC that an object cannot be moved. But what are the perf implications of pinning from GC's POV? Since GC cannot move these pinned objects around, it makes the dead space right before the pinned objects into a free object and this free object could be used to accommodate the younger generation's survivors. But here's a problem - as we've seen from the generational discussion above, if we simply promote these pinned objects into the older generation, it means these free spaces are also part of that older generation and the only way to use them to accommodate survivors from the younger generation is if we actually do a GC on the younger generation (otherwise we don't even have "survivors from the younger generation"). However, if we could keep these free spaces in gen0 they can be used by user allocations. That's why GC has a feature called demotion where we would demote these pinned objects to gen0 which means the free spaces in between them would be part of gen0 and we can use them immediately when user code allocates. 
+
+Fig. 5 - demotion (I took this from an old slide so this looks a bit different from the previous segment pictures)
+
+<img src=".\demotion.jpg" alt="demotion" style="zoom:80%;" />
+
+Since the gen0 allocations can happen in these free spaces, it means they will consume the gen0 budget without increase the gen0 size (unless the free spaces can’t satisfy all the gen0 budget in which case it will need to grow gen0).
+
+However, GC does not demote unconditionally because we don't want to leave many pinned objects in gen0 which means we'd have to look at them again in every GC for possibly many GCs (since they are part of gen0, whenever we do a gen0 GC we need to look at them). This means if you have a heavy pinning situation it can still cause fragmentation problems in gen2. Again, GC does have mechanisms to combat these situations. But if you want to put less stress on the GC, you could follow this rule from the user's POV -
+
+`Pin early, pin in batches`
+
+The idea is if you pin objects in the portion of the heap that's already compacted, meaning the objects already don't need to move so fragmentation wouldn't be an issue. And if you do need to pin later, a common practice is to allocate a batch of buffers and pin them together instead of allocating one and pinning it each time you need one. In .NET 5 we introduced a new feature called POH ([Pinned Object Heap](https://github.com/dotnet/runtime/blob/master/docs/design/features/PinnedHeap.md)) that allows you to tell the GC to put pinned objects on a specific heap at allocation time. So if you do have such control, allocating them on the POH would help to mitigate the fragmentation issue because they are no longer scatter around on the normal heap.
+
+- ###### Finalizers
+
+The finalize queue is another source of roots. If you've been writing .NET apps for a while the chances are you've heard that finalizers are something you need to avoid. However sometimes the finalizers are not your code but from libraries you are using. Since this is a very user facing feature let’s look at it in detail. Below are fundamental perf implications of finalizers -
+
+*Allocation*
+
+·    If you allocate a finalizable object (meaning its type has a finalizer), right before GC returns to the allocation helper on the VM side it will record this object's address on the finalize queue.
+
+·    Having a finalizer means you cannot allocate with fast alloc helpers anymore since the allocation of every finalizable object has to come to GC to register. 
+
+However, this cost is usually not noticeable because it's very unlikely that you'd be allocating mostly finalizable objects. The more significant cost usually comes from when GCs actually happen and how finalizable objects are handled during a GC. 
+
+*Collection*
+
+When a GC happens, it will discover the objects that are still live and promote them. Then it will check with objects on the finalize queue to see if they are promoted - if an object is not promoted it means it's dead, even though it can't be reclaimed (see why in the next paragraph). If you have tons of finalizable objects *in the generations being collected*, this cost alone could be noticeable. Let's say you have a ton of finalizable objects that have been promoted to gen2 (just because they kept surviving), and you are doing a lot of gen2 GCs, in each of the gen2 GC, we'd need to spend time to scan all of the finalizable objects. If you do gen2 GCs very infrequently you don't pay this cost.
+
+Here comes the reason why you've hearing "finalizers are bad" - in order to run the finalizer for this object that GC already discovered to be dead, it now needs to be alive. And since our GC is generational it means it will be promoted to a higher generation and as we talked about above, this in turn means it'll take a higher generation GC, i.e., a more expensive GC to collect this object. So if a finalizable object is discovered dead in a gen1 GC, instead of being collected in that gen1 GC, it'll need to wait till next time you do a gen2 GC which might be quite some time away. IOW, the reclamation of this object's memory could be delayed by a lot.
+
+However, if you suppress the finalizer with GC.SuppressFinalize, what you tell the GC is you don't need to run the finalizer of this object. So GC would have no reason to promote it. It will be reclaimed when GC finds it dead. 
+
+*Running finalizers*
+
+This is handled by the finalizer thread. After a GC discovers dead, finalizable objects (that are then promoted), it moves it to the part of the finalize queue that tells the finalizer thread when it asks GC for finalizers to run, and signals to the finalizer thread that there's work to do. After GC is done, the finalizer thread will run those finalizers. Objects moved to this part of the finalize queue are said to be "ready for finalization". You probably have seen various tools mentioning this term, e.g., sos's !finalizequeue command tells you which part of the finalize queue stores objects ready for finalization like this:
+
+`Ready for finalization 0 objects (000002E092FD9920->000002E092FD9920)`
+
+And you will often see this is 0 because the finalizer thread runs at high priority so the finalizers will be run quickly (unless they are blocked on something).
+
+The figure below illustrates 2 objects and how the finalizable object F evolves. As you can see, after it gets promoted to gen1, if there's a gen0 GC, F is still alive since gen1 is not collected; F can only truly become dead when we do a gen1 GC where we look at the generation F lives in.
+
+Fig. 6 - O is non finalizable, F is finalizable
+
+ <img src=".\finalize.jpg" alt="finalization" style="zoom:80%;" />
+
+###### 3. managed memory leaks
+
+Now that we understand the different categories of roots we can talk about the definition of a managed memory leak –
+
+`A managed memory leak means you have at least one user root that refers to, directly or indirectly, more and more objects as the process runs. It’s a leak because the GC by definition cannot reclaim memory of these objects so even if the GC tried the hardest (ie, doing a full blocking GC) the heap size still ends up growing.`
+
+So the easiest way, if it’s feasible to do, to identify if you have a managed memory leak is to simply inducing full blocking GCs at points that you know you should have the same memory usage (e.g., at the end of each request), and verify that the heap size does not grow. Obviously this is just a way to help investigate memory leaks - when you are running your app in production you wouldn't normally want to be inducing full blocking GCs.
+
+- ##### **“Mainline GC scenario”** **vs “not mainline”**
+
+If you had a program that just used the stack and created some objects to use, GC has been optimizing that for years and years. Basically “scan stacks to get the roots and handle the objects from there”. This is the mainline GC scenario that many GC papers assume as the only scenario. Of course as a commercial product that has existed for decades and having to accommodate various customer requests, we have a bunch of other things like GC handles and finalizers. The important thing to understand there is while over the years we also optimized for those, we operate based on assumptions that “there aren’t too many of those” which obviously is not true for everyone. So if you do have many of those, it’s worth looking at if you are diagnosing a memory problem. In other words, if you don’t have any memory problem, you don’t need to care; but if you do (e.g., high % time in GC), they are good things to suspect.
+
+- ##### **Part of the GC pause that’s not doing GC at all – thread suspension**
+
+One last part of the GC pauses we haven’t mentioned is the part that’s not doing the GC work at all - I'm referring to the thread suspension mechanism in the runtime. GC calls the suspension mechanism to get threads in the process to stop before the GC work can start. We call this to get threads to their safe points. Because GC might be moving objects around, threads cannot stop at random points; they need to stop at points where the runtime knows how to report references to GC heap objects to the GC so GC can update them as necessary. It's a common misconception that GC is doing the suspension - GC merely calls the suspension mechanism to get your threads to stop. However the suspension is reported as part of the GC pauses because the GC is the primary component that uses it.
+
+We talked about [concurrent vs blocking GC](#Concurrent-GCBackground-GC) so we know that blocking GCs will keep your threads suspended for the duration of the GC while BGC (the concurrent flavor) will keep them suspended for a short while and do most of the GC work while the user threads are running. It’s less common knowledge that it may take a while to get the threads to the suspended state. Most of the time this is very quick but slow suspension is a category of managed memory related perf problems and we will specifically discuss [how to diagnose these](#PerfView-GC-stop-triggers).
+
+Note that only threads that are running managed code are suspended during the suspended part(s) of a GC. Threads running native code are free to run. However, if they need to return to managed code during such a suspension part, they will need to wait till the suspended part is finished.
+
+## **Know when to worry**
+
+As with any performance investigation, the first and foremost thing is to figure out whether you should worry about it.
+
+### **Top level application metrics**
+
+As mentioned above, it’s crucial to have [perf goals](#Know-what-your-perf-goal-is) – these should be represented by one or more top level application metrics. They are application metrics because they tell directly about perf aspects of your application, e.g., concurrent # of requests you handle, average, max, and/or P95 request latency. 
+
+It’s relatively easy to understand using the top level application metrics to indicate whether you have perf regressions or improvements as you develop your product so we will not spend much time here. But one thing worth pointing out is that sometimes it’s not necessarily easy to have these metrics stable enough to have a month to month trend or even a day to day one, simply because the workload does not remain constant from day to day, especially with tail latency measurements. How do we combat this? 
+
+·    This is exactly one of the reasons why it’s important to measure [factors](#Measure-the-impact-of-factors-that-likely-affect-your-perf-metrics) that can affect them. Of course it’s very likely you don’t know all the factors upfront. As you know more, you can add them to your repertoire of things to measure. 
+
+·    Have some top level component metrics that help you decide how much variation there is in your workload. For memory, an easy metric would be how much allocation was done. If during today’s peak hour, you allocated twice the amount of yesterday’s you know that indicates today’s workload perhaps puts more stress on the GC (allocations are definitely not the only factor that affects GC pauses, see the [GC Pauses](#Understanding-GC-pauses-ie-when-GCs-are-triggered-and-how-long-a-GC-lasts) section above). However one reason that makes this a popular thing to keep track of is because it’s directly related to user code – you can see when an allocation happens in a line of code whereas it’s more difficult to correlate GCs with a line of code.
+
+### **Top level GC metrics**
+
+Since you are reading this doc, obviously one of the components you care about is the GC. So what top level GC metrics should you keep track of and how to decide when you should worry?
+
+We provide many different GC metrics you can measure - obviously you don’t need to care about all of them. In fact to establish if/when you should start to worry about GC you just need one or two top level GC metrics. Table 3 lists which top GC metrics are relevant based on your perf goals. How to collect them is described in a [later section](#How-to-collect-top-level-GC-metrics).
+
+Table 3
+
+| **Application perf goal** | **Relevant GC metrics**                           |
+| ------------------------- | ------------------------------------------------- |
+| Throughput                | %  Pause time in GC (maybe also % CPU time in GC) |
+| Tail latency              | Individual GC pauses                              |
+| Memory footprint         | GC  heap size histogram                           |
+
+### **When to worry about GC**
+
+If you understand the [GC fundamentals](#GC-Fundamentals), it should be perfectly obvious that the GC behavior is driven by the application behavior. The top level application metrics should tell you when you have a perf problem. And the GC metrics help you with your investigation of these perf problems. For example, it wouldn't make sense for you to look at the average of the "% Pause time in GC" metric over the course of a day if you know your workload goes dormant during long periods of time during that day because the average of "% Pause time in GC" would be very tiny. A much more sensible way of looking at these GC metrics would be "we had an outage around X o'clock, let's look at the GC metrics around that time to see if GC was likely the cause of it". 
+
+When the relevant GC metrics says GC is having a small effect, it would be more productive to focus your effort elsewhere. *If they indicate GC does have a big impact, this is when you should start worrying about how to do managed memory analysis*, which is what the majority of this doc is about. 
+
+Let’s look at each goal in detail to understand why you should look at their corresponding GC metrics –
+
+**Throughput** 
+
+To get your throughput higher you want GC to interrupt your threads as little as possible. GC will interfere in 2 ways –  
+
+·    GC can pause your threads – blocking GCs will pause them for the whole duration of the GC and BGC will pause for a short amount of time. This pause is indicated by “% Pause time in GC”.
+
+·    GC threads will consume CPU to do the work and while [BGC](#Concurrent-GCBackground-GC) doesn’t pause your threads much, it does compete for CPU with your threads. So there’s another metric called “% CPU time in GC”. 
+
+The 2 numbers can be quite different. “% Pause time in GC” is calculated by 
+
+`Elapsed time while threads are paused by the GC / Total elapsed time of the process`
+
+So if it has been 10s since the process started, and threads were paused due to the GC for 1s, the % Pause time in GC is 10%.
+
+% CPU time in GC can be more or less than % Pause time in GC, even when BGC is not in the picture, because it depends on how CPU is used by other things in the process. When GC is in progress, we would like to see it finish as fast as possible; so we'd like to see it have as high CPU usage as possible during its execution. This used to be a concept that was very confusing but these days it seems to happen much less. I used to get reports from worried folks saying that “when I see a [Server GC](#Server-GC) it uses 100% CPU! I need to reduce this!”. I explained to them this was actually exactly what we’d like to see – when GC has paused your threads we want to use all the CPU we can so we can finish the GC work sooner. Let’s say the % Pause time in GC is 10% and during the GC pauses it achieves 100% CPU usage (eg, if you have 8 cores, GC uses all 8 cores fully), and outside the GC your threads achieve 50% CPU usage, and no BGC is happening (meaning GC only does work while your threads are paused), then % CPU time in GC would be
+
+`(100% * 10%) / (100% * 10% + 50% * 90%) = 18%`
+
+I would suggest to monitor % Pause time in GC to begin with because it’s very cheap to monitor and is a good measure to determine whether you should worry about GC as a top level metric. % CPU time in GC is more expensive to monitor (it would require to actually collect CPU samples) and usually isn’t as crucial unless your app is doing a significant amount of BGCs and is really CPU saturated. 
+
+Usually a well behaved app has < 5% Pause time in GC while it's actively handling workloads. If it’s 3% for your app, it wouldn’t be very productive for you to concentrate on GC – even if you could remove half of it, which would be difficult, you will not improve the total perf by much.
+
+**Tail latency**
+
+[Previously](#Measure-the-impact-of-factors-that-likely-affect-your-perf-metrics) we discussed how to think about measuring factors that attribute to your tail latency. If tail latency is your goal, GCs or longest GCs may occur during those longest requests, in addition to other factors. So it’s important to measure these individual GC pauses to see if/how much they contribute to your latency. There’s lightweight ways to know when a individual GC pause starts and ends as we'll see [later in this doc](#GC-event-sequence).
+
+Now, if your goal is to reduce a specific percentile of latency, it’s not productive to look at individual pauses that don’t affect those requests because reducing them will not make a difference for that percentile. For example, if your current goal is to reduce P95 latency which is around 50ms, you know they are not affected by GCs that take 100ms. Sure, it would be good to get rid of those 100ms GCs (which might affect your P99 latency), but it doesn’t help with your task at hand. 
+
+**Memory footprint**
+
+If you haven’t read [GC heap size vs process memory size](#GC-heap-is-only-one-kind-of-memory-usage-in-your-process), and how to [measure GC heap size](#How-to-look-at-the-GC-heap-size-properly) correctly, I strongly recommend to do it now. It’s actually not uncommon that a managed process has noticeable or even significant memory usage other than the GC heap so it’s important to understand whether that’s the case or not. If the GC heap is a small percentage of the total process memory usage, it wouldn’t make sense for you to focus on reducing GC heap size.
+
+## **Picking the right tools and interpreting the data**
+
+### **The perf tooling landscape**
+
+I cannot stress the importance of picking the right tools enough. So often I’ve seen folks spending so much time (sometimes months) trying to figure out an issue because they hadn’t discovered the right tool and/or how to use it. This is not to say you will not need to spend some effort even with the right tool - sometimes it takes a minute but other times it may be many minutes or hours.
+
+Another challenge with picking the right tools is unless you are doing a basic analysis, there simply aren’t many tools to choose from. IOW, there are a lot more tools that are able to solve simple problems, so if you are solving one of those, which one you pick is not that important. For example, if you have a severe managed memory leak you can repro in your development environment, you will be able to easily find a tool that can compare heap snapshots so you can see what objects survived that shouldn't. It’s very likely you will solve your problem that way. You don’t need to care about things like when to measure the heap size like what we talked about extensively in the “[how to measure GC heap size properly](#How-to-look-at-the-GC-heap-size-properly)” section. 
+
+### **The tool we use and how it does its job** 
+
+The tool the runtime team produces and what I use often is [PerfView](https://github.com/microsoft/perfview/) – many of you probably have heard of it. But I haven’t seen many people use it to its full extent. At its heart, PerfView uses [TraceEvent](#https://github.com/microsoft/perfview/tree/master/src/TraceEvent) which is a library that decodes ETW (Event Tracing for Windows) events from the runtime providers, the kernel providers and a bunch of other providers. If you haven’t worked with ETW events before, you can think of them as data that various components emit over time. And they share the same format so events from different components can be looked at together by tools that know how to interpret ETW events. This is a really powerful thing for perf investigation. In ETW terms events are categorized by provider (eg, the runtime provider), keywords (eg, GC) and verbosity levels (eg, Informational which usually means lightweight and Verbose which usually is much heavier weight). The cost of using ETW is proportional to the volume of events you are collecting. At GC Information level the overhead is very small and you can collect these events always if you need to.
+
+Since .NET Core is cross-platform, and ETW does not exist on Linux, we have other eventing mechanisms that aim to make this process transparent such as LTTng or EventPipe. So, if you use the TraceEvent library, you can get info on these events on Linux just like you do on Windows with ETW events. However, there are [different tools](https://github.com/dotnet/diagnostics/blob/master/documentation/dotnet-trace-instructions.md) to collect these events on Linux. 
+
+Another functionality in PerfView that I use less often but as customers of the GC you probably use a lot more often is heap snapshots, i.e., it shows what objects there are on the heap and how they are connecting to each other. The reason why I don’t use it often is because GC isn’t concerned with the type of objects.
+
+You might also have used our debugger extension [SoS](https://docs.microsoft.com/en-us/dotnet/framework/tools/sos-dll-sos-debugging-extension). I rarely use SoS for perf analysis because it’s much more a debugging tool than a profiling tool. It also doesn’t do much to look at GCs, mostly it’s for looking at the heap, i.e., heap stats and dump individual objects. 
+
+For the rest of this section, I will show you how to do memory analysis the proper way with PerfView. I will be referring back to the [Fundamentals](#Memory-Fundamentals) many times to explain why you would want to do the analysis this way so it makes sense instead of having you memorize what we do here.
+
+### **How to start a memory perf analysis**
+
+Do any of these sound familiar to you when you start a memory perf analysis?
+
+1)   Capture a CPU profile and see if you can reduce CPU in any top functions
+
+2)   Open a heap snapshot in a tool and see what you can get rid of
+
+3)   Capture the allocations and see what you can get rid of 
+
+Depending on what problems you are trying to solve, these may be flawed. Let’s say you have a [tail latency](#Measure-the-impact-of-factors-that-likely-affect-your-perf-metrics) problem and you are doing 1). You are probably looking to see if you could reduce the CPU usage in your code or perhaps some library code. But if your tail latency is affected by long GCs, reducing these will unlikely affect your long GC situation at all.
+
+The productive way to approach a problem is to reason about factors that contribute to the perf goal and start from there. We talked about the [top level GC metrics](#top-level-GC-metrics) that contribute to [different perf goals](#Know-what-your-perf-goal-is). We’ll discuss how to collect them and see how we analyze each of them. 
+
+Most readers of this document already know how to collect general metrics related to memory so I will briefly cover them. Since we know that [the GC heap is only part of the memory usage in a process, but GC is aware of the physical memory load](#Understanding-the-GC-heap-memory-usage-vs-the-processmachine-memory-usage), we would want to measure the process's memory usage and the physical memory load on the machine. On Windows one way you can achieve this is by collecting the following performance counters: 
+
+`Memory\Available MBytes`
+`Process\Private Bytes`
+
+For general CPU usage, you could monitor the 
+
+`Process\% Processor time`
+
+counter. A common practice to investigate CPU time is to take a CPU sample profile for a short period of time every so often (e.g., some folks might do this once for a minute every hour) and see the aggregated CPU stacks.
+
+### **How to collect top level GC metrics**
+
+GC emits lightweight Informational level events that you can collect (and leave on all the time if you want) that covers all top level GC metrics. Use this PerfView commandline to collect these events –
+
+`perfview /GCCollectOnly /AcceptEULA /nogui collect`
+
+after you are done, press `s` in the perfview cmd window to stop it. 
+
+This should be run long enough to capture enough GC activities, e.g., if you know problems occur at times, this should cover time that *leads* up to when problems happen (not only during problematic time). If you are not sure when the problem starts to occur, you can just have it on for a long time. 
+
+If you know how long to run the collection, use the following (this is used much more often actually) –
+
+`perfview /GCCollectOnly /AcceptEULA /nogui /MaxCollectSec:1800 collect`
+
+and replace 1800 (half an hour) with however many seconds you need. You can of course apply this arg to other commandline as well. This will result in a file called PerfViewGCCollectOnly.etl.zip. In PerfView terms, we call this a GCCollectOnly trace.
+
+On Linux there's sort of an equivalent which is this dotnet trace commandline:
+
+`dotnet trace collect -p <pid> -o <outputpath with .nettrace extension> --profile gc-collect --duration <in hh:mm:ss format>`
+
+It's sort of an equivalent because it collects the same GC events but only for one process that already started, whereas the perfview commandline collects ETW for the whole machine, ie, the GC events from every process on that machine, even the ones started after the beginning of the collection. 
+
+There are other ways to collect top level GC metrics, for example, on .NET Framework we had GC perf counters; on .NET Core [some GC counters](https://docs.microsoft.com/en-us/dotnet/core/diagnostics/dotnet-counters#dotnet-counters-collect) have also been added. The most significant difference between counters and events are counters are sampling whereas events capture all GCs, but sampling can be good enough. In .NET 5 we also added a GC sampling API -
+
+```csharp
+public static GCMemoryInfo GetGCMemoryInfo(GCKind kind);
+```
+
+The GCMemoryInfo it returns is based on the `GCKind` which is explained in [GCMemoryInfo.cs](https://github.com/dotnet/runtime/blob/master/src/libraries/System.Private.CoreLib/src/System/GCMemoryInfo.cs) -
+
+```csharp
+/// <summary>Specifies the kind of a garbage collection.</summary>
+/// <remarks>
+/// A GC can be one of the 3 kinds - ephemeral, full blocking or background.
+/// Their frequencies are very different. Ephemeral GCs happen much more often than
+/// the other two kinds. Background GCs usually happen infrequently, and
+/// full blocking GCs usually happen very infrequently. In order to sample the very
+/// infrequent GCs, collections are separated into kinds so callers can ask for all three kinds 
+/// while maintaining
+/// a reasonable sampling rate, e.g. if you are sampling once every second, without this
+/// distinction, you may never observe a background GC. With this distinction, you can
+/// always get info of the last GC of the kind you specify.
+/// </remarks>
+public enum GCKind
+{
+    /// <summary>Any kind of collection.</summary>
+    Any = 0,
+    /// <summary>A gen0 or gen1 collection.</summary>
+    Ephemeral = 1,
+    /// <summary>A blocking gen2 collection.</summary>
+    FullBlocking = 2,
+    /// <summary>A background collection.</summary>
+    /// <remarks>This is always a gen2 collection.</remarks>
+    Background = 3
+};
+```
+
+GCMemoryInfo provides a wide variety of info related to this GC such as its pause time, committed bytes, promoted bytes, whether it's compacting or concurrent, and info for each generation that got collected. Please see [GCMemoryInfo.cs](https://github.com/dotnet/runtime/blob/master/src/libraries/System.Private.CoreLib/src/System/GCMemoryInfo.cs) for the complete list. You can call this API to sample the GCs at the frequency you desire in the process.
+
+### **Displaying top level GC metrics**
+
+These are conveniently displayed in the `GCStats` view in PerfView with the trace you just collected. 
+
+Open the PerfViewGCCollectOnly.etl.zip file in PerfView, meaning either by running PerfView and browsing to that directory and double clicking on that file; or running the “PerfView PerfViewGCCollectOnly.etl.zip” commandline. You will see that there are multiple nodes under that filename. What we are interested in is the `GCStats` view under the `“Memory Group”` node. Double click on it to open it. At the top we have something like this
+
+<img src=".\gcstats.jpg" align="left" alt="GCStats" style="zoom:80%;" />
+
+I ran Visual Studio which is a managed app – that's the devenv process at the top. 
+
+For each of these processes, you will get the following details - I've added comments to the ones that are not self-explanatory:
+
+`Summary` – this includes things like the commandline, CLR startup flags, % time pause for GC, etc.
+
+`GC stats rollup by generation` – for gen0/1/2 it has things like how many GCs of that gen were done, their mean/average pauses, etc.
+
+`GC stats for GCs whose pause time was > 200ms`
+
+`LOH Allocation Pause (due to background GC) > 200 Msec for this process` - There is a caveat with large object allocation   w.r.t. Background GC which is we do not allow too much LOH allocation while BGC is in progress. If you have allocated too much during BGC, you would see a table appear here that tells you which threads were blocked during BGC (and for how long) because there's been too much LOH allocation. This is generally a sign that tells you that reducing LOH allocations will help with not having your threads blocked.
+
+`Gen2 GC stats`
+
+`All GC stats`
+
+`Condemned reasons for GCs`
+
+`Finalized Object Counts`
+
+`Summary` explanation
+
+·    `Commandline` self-explanatory.
+
+·    `Runtime version` it’s fairly useless as we just show some generic version. However, you can use the FileVersion event in the Events view to get the exact version of the runtime you are using. 
+
+·    `CLR Startup Flags` the main thing for GC investigation purpose is to look for CONCURRENT_GC and SERVER_GC. If you don't have either one it *usually* means you are using Workstation GC with concurrent GC disabled. This is unfortunately not absolute because after we captured this event it could be changed. There are other things you can use to validate this. Note: be warned that currently [.NET Core/.NET 5 does not emit those flags](https://github.com/dotnet/runtime/issues/52042), so you will see nothing here.
+
+·    `Total CPU Time and Total GC CPU Time` these would always be 0 unless you are actually collecting CPU samples.
+
+·    `Total Allocs` total allocations you've done during this trace for this process.
+
+·    `MSec/MB Alloc` this is 0 unless you collect CPU samples (it would be Total GC CPU time / Total allocated bytes).
+
+·    `Total GC pause` total wallclock time paused by GCs. Note that this includes suspension time, ie, the time it takes to suspend managed threads before GC can start.
+
+·    `% Time paused for Garbage Collection` this is the “% Pause time in GC” metric.
+
+·    `% CPU Time spent Garbage Collecting` this is the “% CPU time in GC” metric. It’s NaN% unless you collect CPU samples.
+
+·    `Max GC Heap Size` maximum managed heap size during this trace for this process.
+
+·    The rest are links and we’ll go through some of them in this doc.
+
+The `All GC stats` table displays every GC (if there are too many it’ll have a link to  the GCs not  displayed) that happened during the trace collection. There are many columns in this table. Since this is a very wide table, I will show only the columns from this table relevant for each topic. 
+
+The other top GC metrics, individual pauses and heap sizes, are displayed as part of this table like this (Peak MB means the GC heap size on entry of that GC and After is  on exit) -
+
+| **GC**    | **Pause** | **Peak** | **After** |
+| :-------: | :-------: | :------: | :-------: |
+| **Index** | **MSec**  | **MB**   | **MB**    |
+| 804       | 5.743     | 1,796.84 | 1,750.63  |
+| 805       | 6.984     | 1,798.19 | 1,742.18  |
+| 806       | 5.557     | 1,794.52 | 1,736.69  |
+| 807       | 6.748     | 1,798.73 | 1,707.85  |
+| 808       | 5.437     | 1,798.42 | 1,762.68  |
+| 809       | 7.109     | 1,804.95 | 1,736.88  |
+
+Now, this is an html table and you can’t sort so if you do want to sort (eg, finding out the longest individual GC pauses) you can click on the “View in Excel” link at the beginning of each process -
+
+·    `Individual GC Events` 
+
+​             o  `View in Excel`
+
+This will open up the table above in Excel so you can sort whichever column you like. On the GC team, since we need to slice and dice the data much more, we have our own [perf infrastructure](https://devblogs.microsoft.com/dotnet/gc-perf-infrastructure-part-1/) that uses TraceEvent directly. 
+
+### **Other relevant views in PerfView** 
+
+It’s useful to introduce a few other views in PerfView besides the GCStats view as we’ll be using them.  
+
+<img src=".\OtherViews.jpg" alt="other views" style="zoom:80%;" />
+
+**CPU Stacks** is what you would expect – if you collect CPU sample events in your trace this view will light up. One thing worth mentioning is that I always clear the 3 highlighted textboxes to begin with - you’ll need to click update to refresh after you do that: 
+
+<img src=".\CPUStacks.jpg" alt="demotion" style="zoom:80%;" />
+
+I rarely find these 3 textboxes useful. Occasionally I would want to group by modules and you can read the help in PerfView to see how to do that. 
+
+**Events** is what we mentioned above – the raw events view. It might sound quite user unfriendly because it’s raw but it has a few functionalities that make it quite convenient. You can filter events by the Filter textbox. You can use ‘|’ if you need to filter by multiple strings. If I want to get all events with file in their names and the GC/Start event, I use file|GC/Start (no space). 
+
+<img src=".\EventsView.jpg" alt="demotion" style="zoom:80%;" />
+
+Double clicking on the name of an event shows all the occurrences of that event and you can search for specific details. For example, if I want to find out the exact version of the coreclr.dll I can type **coreclr** in the Find textbox:
+
+<img src=".\FileVer-coreclr.jpg" alt="demotion" style="zoom:80%;" />
+
+Then you can see the exact version info of the coreclr.dll you are using.
+
+I also frequently use “Start/End” to limit the time range of events, “Process filter” to limit it to a certain process and “Columns to display” to limit the fields of events to display (which allows me to sort on a certain field of an event). 
+
+**GC Heap Alloc Ignore Free** under the Memory group is what we’ll use to look at allocations. 
+
+**Any Stacks** shows you all the events with their stacks (if the stacks were collected). I find it convenient if there’s a specific event I want to look and there isn’t already an established view for it or the established view doesn’t offer what I’m looking for. 
+
+##### **Diffing stack views**
+
+Views that are like the CPU stacks view (i.e., the Heap Snapshot view or the GC Heap Alloc view) offer a diff-ing functionality. If you open 2 traces in the same PerfView instance, when you open a stack view for each of them, and the Diff menu offers a “with Baseline” option (search for “Diffing Two Traces” in Help\Users Guide). 
+
+A word about diffing 2 runs – when you diff 2 runs to see what regressed, it’s best to have the workload as similar as possible. Let’s say you made a perf change to reduce allocations, instead of running 2 runs for the same amount of time, it’s better to run them with the same number of requests because you know your new build is handling the same amount of work. Otherwise one run might be running faster therefore handling more requests which inherently means it already needs to do different amounts of allocations. It just means it’s harder to do the comparison.
+
+### **High % Pause time in GC**
+
+If you don't know how to collect GC pause time data, please follow instructions in ["How to collect top level GC metrics"](#How-to-collect-top-level-GC-metrics)
+
+If the total pause time is high, it could be due to too many GCs (i.e., GCs triggered too often), GC pauses being too long or both.
+
+- #### Too many pauses, i.e., too many GCs
+
+According to part of [our one rule](#The-one-rule-to-remember), how often GCs are triggered are determined by what doesn’t survive. So if you are doing a lot of temporary object allocations (meaning they don’t survive), it means you will trigger a lot of GCs. In this case it makes sense to look at these allocations. It’d be great if you can eliminate some but sometimes this is not practical. We mentioned [3 ways](#3-ways-to-look-at-allocations) to profile allocations. Let’s see how to perform each analysis.  
+
+#### Measure allocations
+
+**Getting the number of allocated bytes**
+
+In .NET 3.0+ we provide a [GC.GetTotalAllocatedBytes](https://docs.microsoft.com/en-us/dotnet/api/system.gc.gettotalallocatedbytes?view=net-6.0) API that gives you the total allocated bytes at the time it's called. And we already know that in the GCStats view in PerfView you get the total number of allocated bytes in the summary of each process. In this view you also get gen0 allocated bytes per GC: 
+
+| GC Index | Gen   | Gen0 Alloc MB  |
+| -------: | ----: | -------------: |
+| 7        | 0N    | 95.373 |
+| 8        | 1N    | 71.103 |
+| 9        | 0N    | 103.02 |
+| 10       | 2B    | 0      |
+| 11       | 0N    | 111.28 |
+| 12       | 1N    | 94.537 |
+
+In the Gen column, ‘N’ means Nonconcurrent GC, ‘B’ means Background. So full blocking GCs are shown as 2N. Since only gen2 GCs can be background you will only see 2B, never 0B or 1B. You might also see ‘F’ which means Foreground GCs – the ephemeral GCs happening while BGC is in progress.
+
+Note that it’s 0 for 2B because we do a gen0 or a gen1 GC at the beginning of a BGC if gen0 or gen1 allocation budget is exceeded so the number of gen0 allocated bytes is shown for the gen0 or gen1 GC. 
+
+We know that a GC will be triggered when gen0’s allocation budget is exceeded. This data is not shown by default in GCStats (just because there are already so many columns in the tables). But you can get it by clicking on the <ins>**Raw Data XML file (for debugging)**</ins> link before the tables in GCStats. An xml file will be generated and contains more detailed data. For each GC you will see this (I trimmed it down so it’s not too wide) –
+
+```xml
+<GCEvent GCNumber="9" GCGeneration="0" Reason="AllocSmall">
+  <GlobalHeapHistory FinalYoungestDesired="9,830,400" NumHeaps="12"/>
+```
+
+The FinalYoungestDesired is the final gen0 budget computed for this GC. Since we equalize the budget for all heaps this means every heap has this same budget. Since there are 12 heaps, any heap exhausting its gen0 budget would cause the next GC to be triggered. So in this case it means there will be at most 12*9,830,400 = 117 MB allocated till the next GC is triggered. As we can see the next GC is a BGC and its Gen0 Alloc MB is 0 because we attribute to the ephemeral GC we do at the beginning of this BGC, GC#11 which allocated 111.28 MB in gen0 since GC#9 ended.
+
+**Looking at sampled allocations with stacks**
+
+Naturally you’d want to find out about these allocations. GC provides an event called the AllocationTick event which is fired for approximately every 100KB worth of allocations. For small object heap 100KB means a lot of objects (that means it’s sampling for SOH) but for LOH this is actually accurate because each object is at least 85000 bytes large. This event has a field called AllocationKind – small means it was fired for SOH by the allocation that *happened* to make the accumulative alloc amount on that SOH go over 100KB (then the amount would get reset). So you don’t actually know how big that last allocation is. But based on the frequency of this event it’s still a very good approximation to see which types get allocated the most, with the callstacks that allocated them.
+
+Obviously collecting this would add noticeably more overhead than just collecting a GCCollectOnly trace but this is still tolerable. 
+
+`PerfView.exe /nogui /accepteula /KernelEvents=Process+Thread+ImageLoad /ClrEvents:GC+Stack /BufferSize:3000 /CircularMB:3000 collect`
+
+This will collect the AllocationTick events with their callstacks that allocated the object that got sampled. Then you can open this in the “GC Heap Alloc Ignore Free (Coarse Sampling)” view under the Memory group:
+
+<img src=".\HeapAlloc.jpg" alt="HeapAlloc" style="zoom:80%;" />
+
+Clicking on a type gives you the stacks that allocated instances of that type: 
+
+<img src=".\AllocStack.jpg" alt="AllocStack" style="zoom:80%;" />
+
+Note that you can [diff 2 GC Heap Alloc views](#Diffing-stack-views) when you open both traces in the same PerfView instance –
+
+<img src=".\DiffAlloc.jpg" alt="DiffAlloc" style="zoom:80%;" />
+
+And you can double click on each type to see the callstacks that allocated them.
+
+Another way to look at the AllocationTick events is to use the Any Stacks view because it groups by the size. For example, this is what I saw from a customer’s trace (type names anonymized or shortened):
+
+| **Name**                                                     | **Inc**   |
+| ------------------------------------------------------------ | --------- |
+| Event  Microsoft-Windows-DotNETRuntime/GC/AllocationTick     | 627,509   |
+| + EventData TypeName  Entry[CustomerType,CustomerCollection][] | 221,581   |
+| \|+ EventData Size 106496                                    | 4,172     |
+| \|\|+ EventData Kind Small                                   | 4,172     |
+| \|\| + coreclr                                               | 4,172     |
+| \|\|   + corelib!System.Collections.Generic.Dictionary`2[CustomerType,System.__Canon].Resize(int32,bool) | **4,013** |
+| \|\|   +  corelib!System.Collections.Generic.Dictionary`2[CustomerType,System.__Canon].Initialize(int32) | **159**   |
+| \|+ EventData Size 114688                                    | 3,852     |
+| \|\|+ EventData Kind Small                                   | 3,852     |
+| \|\| + coreclr                                               | 3,852     |
+| \|\|   + corelib!System.Collections.Generic.Dictionary`2[CustomerType,System.__Canon].Resize(int32,bool) | **3,742** |
+| \|\|   +  corelib!System.Collections.Generic.Dictionary`2[CustomerType,System.__Canon].Initialize(int32) | **110**   |
+
+What this is saying is most of the allocations came from Resizing of a dictionary, which you can also see from the GC Heap Alloc view but the sample count info gives you more clues (Resize has 4013 counts while Initialize has 159 counts). So if it’s practical for you to make a better prediction of how large the dictionary will get, you could set the initial capacity to be larger to cut down these allocations dramatically.
+
+**Looking at the memory clearing cost with CPU samples**
+
+If you don’t have a trace with these AllocationTick events but with CPU samples (which is very common), you can also look at the cost of memory clear –
+
+<img src=".\CPUAlloc.jpg" alt="CPUAlloc" style="zoom:80%;" />
+
+If you look at the caller of memset_repmovs, the highlighted 2 callers are from GC’s memory clear before handing new objects out:
+
+<img src=".\memset.jpg" alt="memset" style="zoom:80%;" />
+
+(this is with .NET 5, if you have older versions you would see WKS::gc_heap::bgc_loh_alloc_clr instead of WKS::gc_heap::bgc_uoh_alloc_clr). 
+
+In my example since allocation is pretty much all the test does, the allocation cost is very high – 25.6% exclusive cost of total CPU usage.
+
+#### **How to see why a GC decided to collect a generation**
+
+For each GC there’s a column in GCStats called “Trigger Reason”. This tells you how this GC was triggered. Possible Trigger reasons are defined as `GCReason` in [ClrTraceEventParser.cs](https://github.com/microsoft/perfview/blob/master/src/TraceEvent/Parsers/ClrTraceEventParser.cs) in the PerfView repo:
+
+```csharp
+public enum GCReason
+{
+  AllocSmall = 0x0,
+  Induced = 0x1,
+  LowMemory = 0x2,
+  Empty = 0x3,
+  AllocLarge = 0x4,
+  OutOfSpaceSOH = 0x5,
+  OutOfSpaceLOH = 0x6,
+  InducedNotForced = 0x7,
+  Internal = 0x8,
+  InducedLowMemory = 0x9,
+  InducedCompacting = 0xa,
+  LowMemoryHost = 0xb,
+  PMFullGC = 0xc,
+  LowMemoryHostBlocking = 0xd
+}
+```
+
+Out of these reasons the most common you’d see (and want to see) is *AllocSmall* – this is saying the gen0 budget is exceeded. If the most common one you see is say *AllocLarge*, it most likely indicates a problem – it’s saying your GC was triggered because you exceeded the LOH budget by allocating large objects. And as we know, that means it will [trigger a gen2 GC](#LOH-Large-Object-Heap):
+
+<img src=".\TriggerReason.jpg" alt="TriggerReason" style="zoom:80%;" />
+
+And as we know that triggering frequent full GCs is usually a recipe for performance problems. Other trigger reasons due to allocations are *OutOfSpaceSOH* and *OutOfSpaceLOH* – you see these much less frequently than AllocSmall and AllocLarge – these are for when you are close to physical space limit (e.g., if we are getting close to the end of the ephemeral segment). 
+
+The ones that almost always raise a red flag are the `Induced` ones as those mean some code actually is triggering GCs on its own. We have a GCTriggered event specifically for finding out what code triggered a GC with its callstack. You can collect a very lightweight trace with just the GC informational level with stack and minimal kernel events:
+
+`PerfView.exe /nogui /accepteula /KernelEvents=Process+Thread+ImageLoad /ClrEvents:GC+Stack /ClrEventLevel=Informational /BufferSize:3000 /CircularMB:3000 collect`
+
+And then look at the stacks for the GCTriggered events in Any Stacks view:
+
+<img src=".\InducedGC.jpg" alt="InducedGC" style="zoom:80%;" />
+
+So “Trigger reason” is how a GC starts or comes into existence. If the most common reason for a GC to start is due to allocating on the SOH, that GC would start as a gen0 GC (because the gen0 budget was exceeded). Now *after* the GC starts, we then decide what generation we would actually collect. It might stay as a gen0 GC, or get escalated to a gen1 or even a gen2 GC – this is something we decide as one of the very first things we do in a GC. And factors that would cause us to escalate to a higher generation GC are what we called “condemned reasons” (so for a GC there’s only one trigger reason but can be multiple condemned reasons).
+
+Here is the explanation text that appears in the “Condemned reasons for GC” section before the table itself
+
+*This table gives a more detailed account of exactly why a GC decided to collect that generation. Hover over the column headings for more info.*
+
+I won’t repeat the info here. The most interesting ones are what escalate to gen2 GCs – usually these are caused by high memory load or high fragmentation in gen2.
+
+- #### Long individual pauses
+
+If you don't know how to collect GC pause time data, please follow instructions in ["How to collect top level GC metrics"](#How-to-collect-top-level-GC-metrics)
+
+If you are unfamiliar with what contributes to an individual GC pause please read the [GC Pauses](#Understanding-GC-pauses-ie-when-GCs-are-triggered-and-how-long-a-GC-lasts) section first which explains what factors contribute to GC pause time. 
+
+As we know, all ephemeral GCs are blocking and gen2 GCs can be either blocking or background (BGC). Ephemeral GCs and BGCs are supposed to incur short pauses. But things could go wrong and we’ll show how to analyze these situations.
+
+If the heap size is big, we know a blocking gen2 GC is going to incur a long pause. But we generally favor BGCs when we need to do gen2 GCs. So long GC pauses are due to blocking gen2 GCs, we’d want to figure out why we are doing these blocking gen2 GCs. 
+
+So long individual pauses can be due to the following factors or a combination of them –
+
+·    There’s simply a lot of GC work to do during the pause time. 
+
+·    GC is trying to do work but can’t because [CPU is taken away](#How-long-an-individual-GC-lasts).
+
+Let’s see how to analyze each scenario.
+
+#### **First of all, do you have a managed memory leak?**
+
+If you don’t know what a managed memory leak is please review [that section](#3-managed-memory-leaks) first. By definition this is not something GC can help you with. If you have a managed memory leak, it’s guaranteed GC will have more and more work to do.
+
+Inducing full blocking GCs on production may be very undesirable so it’s important to do your due diligence during the development stage. For example, if your product handles requests, you could induce a full blocking GC at the end of every request or every N requests. If you believe the memory usage should be the same, you should be able to verify that with a tool. Many tools can be used in this case since this is a simple scenario. So of course PerfView also has this functionality. You can take a heap snapshot via Memory\Take Heap Snapshot. It does have some options that are not completely straightforward – 
+
+<img src=".\HeapSnap.jpg" alt="HeapSnap" style="zoom:80%;" />
+
+“Max Dump K Objs” is an attempt to be “smart” so it doesn’t dump every single object. I always increase it to at least 10x the default value (250). And the Freeze option is there for production diagnostics when you don’t want to incur a full blocking GC pause. So in prod you'd keep this unchecked and it will capture a heap snapshot concurrently while the threads are running. But if you are doing this while developing and trying to understand the basic behavior of your app there’s no reason why you wouldn’t want to check it so you get an accurate picture. 
+
+Then the generated .gcDump file is open in PerfView with a stack like view that shows you the roots info (eg, a GC handle holds onto this object) and the aggregation info on instances of the types in the dump. Since this is a stack like view it offers the diff-ing function so you can take 2 gcDump files and diff them in PerfView.
+
+When you are doing this on production, you could try without Freeze first. If you already have a dump from production, you can also load it into PerfView via the "Memory\Take Heap Snapshot From Dump" option, which gives you a similar dialog box as the above that generates a .gcDump file. When you open this resulting file it will show you the objects sorted by the accumulative sizes per type (make sure you clear the highlighted textboxes - when not cleared they can show very misleading results)-
+
+<img src=".\HeapStack.jpg" alt="HeapStack" style="zoom:80%;" />
+
+If you click on a type, it will display which types hold onto it -
+
+<img src=".\ObjectGraph.jpg" alt="ObjectGraph" style="zoom:80%;" />
+
+For those who are used to using the sos !gcroot command in the old days to find out what objects are keeping your objects of interest alive, this is obviously a much more efficient way to diagnose this.
+
+#### **Are the long pauses due to ephemeral GCs, full blocking GCs or BGCs?**
+
+The GCStats view has a convenient rollup table at the top of each process that shows you the Max/Mean/Total pauses by generation (I should really have full blocking GCs and BGCs separate but for now you can refer to the Gen2 table). An example:
+
+<img src=".\Rollup.jpg" alt="Rollup" style="zoom:80%;" />
+
+#### **Figuring out the amount of work for gen2 GCs**
+
+For gen2 GCs, we’d like to see most or all of them done as BGCs. But if you do see a full blocking GC (denoted as 2N in GCStats), chances are its pause time is long if your heap is big (you will see gen2 GCs have very high Promote MB compared to ephemeral GCs’). Usually what folks do at this point is to take a Heap Snapshot to see what’s on the heap and try to reduce that. However the first thing to figure out is why you are doing full blocking GCs in the first place. You can check the Condemned Reasons table for this. The most common reasons are [high memory load](#GC-is-per-process-but-is-aware-of-physical-memory-load-on-the-machine) and [gen2 fragmentation](#How-often-GCs-are-triggered). To find out the memory load that each GC observed, click on the "Raw Data XML file (for debugging)" link right above the "GC Rollup By Generation" table in the GCStats for that process and it will generate an xml file that includes additional information including memory load. An example is (I trimmed away most of the info) -
+
+```c
+<GCEvent GCNumber=      "45" GCGeneration="2" >
+      <GlobalHeapHistory FinalYoungestDesired="69,835,328" NumHeaps="32"/>
+      <PerHeapHistories Count="32" MemoryLoad="47">
+      </PerHeapHistory>
+   </GCEvent>
+```
+
+This says when GC#45 happened it observed a memory load of 47%.
+
+##### Long pause due to bugs
+
+Usually [BGC](#Concurrent-GCBackground-GC) pauses are small. The only times they are long are either due to a rare bug in the runtime (e.g., we fixed a bug where the module iterator was taking a lock and when there are many, many modules in the process this lock contention means it takes very long for each GC thread to iterate through these modules) or you are doing something that’s only done during the STW marking part of a BGC. Since this could be due to non-GC work we’ll discuss how to diagnose this in “Figuring out if the long GCs are due to GC work or not”.
+
+#### **Figuring out the amount of work for ephemeral GCs**
+
+The amount of GC work is roughly [proportional to the survivors](#How-long-an-individual-GC-lasts) which is indicated by the “Promoted Bytes” metric which is a column in GCStats tables –
+
+<img src=".\Promoted.jpg" alt="Promoted" style="zoom:80%;" />
+
+This makes sense – gen1 GCs promote more than gen0 GCs, therefore they take longer. And they don’t promote much since they only collect (usually a small) part of the heap.
+
+If you see ephemeral GCs suddenly promote a lot more, then it’s expected that the pause time will be a lot longer. One reason I’ve seen is because it goes into a code path that’s not hit often and objects survive that are not meant to survive. Unfortunately our tooling for figuring out what causes ephemeral objects to survive isn’t great – we've added [the runtime support](https://github.com/dotnet/runtime/pull/40332) for this in .NET 5 and you can use a special view in PerfView called Generational Aware view to see which old gen objects caused young gen objects to survive - I'll have more details written up for this soon. What you will see is something like this:
+
+<img src=".\GenAware.jpg" alt="GenAware" style="zoom:80%;" />
+
+I’m not aware of any other tools that would tell you this info conveniently (if you know of any tool that tells what old generation objects hold onto young gen objects that make them survive during a GC, please kindly let me know!).
+
+Note that if you have an object in gen2/LOH that holds references of young gen objects and if you don’t need them to refer to those objects anymore, you’ll need to manually set those reference fields to null. Otherwise they will [continue to hold those objects live and cause them to be promoted](#1-The-generational-aspect). For C# programs, this is a main reason that causes ephemeral objects to survive (for F# programs, not so much). You can see this from the Raw XML generated by the GCStats view (click on the "Raw Data XML file (for debugging)" link right above the "GC Rollup By Generation" table) and I trimmed most attributes away from the xml -
+
+```c
+<GCEvent GCNumber="9" GCGeneration="0">
+
+  <PerHeapHistories Count="12" MemoryLoad="20">
+
+  <PerHeapHistory MarkStack="0.145(10430)" MarkFQ="0.001(0)" 
+
+                  MarkHandles="0.005(296)" MarkOldGen="2.373(755538)">
+
+  <PerHeapHistory MarkStack="0.175(14492)" MarkFQ="0.001(0)" 
+
+                  MarkHandles="0.003(72)" MarkOldGen="2.335(518580)">
+```
+
+
+How many bytes promoted by each GC thread due to various kinds of [roots](#What-makes-an-object-survive) are part of the PerHeapHistory data -MarkStack/FQ/Handles are marking stack variables, finalize queue and GC handles respectively and MarkOldGen indicates the number of bytes promoted due to references coming from older generations. So for example, if you are doing a gen1 GC, this is how much gen2 objects holding onto gen0/gen1 objects to make them survive. One of the perf improvements for [Server GC](#Server-GC) we made in .NET 5 is to balance work on the GC threads when we mark the OldGen roots since this usually causes the largest promotion amount. So if you see this number very unbalanced in your app, upgrading to .NET 5 would help.
+
+#### **Figuring out if the long GCs are due to GC work or not**
+
+If a GC is long yet it doesn’t fit into any of the scenarios above, which means there’s not a lot of work for a GC to do yet it still causes a long pause, it means we need to figure out why the GC doesn’t get to do work when it wants. And usually when this happens it happens seemingly randomly. 
+
+An example of an occasional long suspension –
+
+ <img src=".\LongSuspension.jpg" alt="LongSuspension" style="zoom:80%;" />
+
+We use this very handy feature in PerfView called a stop trigger which means “when observing some conditions met, stop the trace as soon as possible so we capture the last part that’s the most relevant”. It already has a few built-in stop triggers specifically for the GC purpose. 
+
+##### GC event sequence
+
+To understand how they work, we need to first take a brief look at the GC event sequence. There are 6 relevant events here –
+
+```
+Microsoft-Windows-DotNETRuntime/GC/SuspendEEStart
+Microsoft-Windows-DotNETRuntime/GC/SuspendEEStop
+Microsoft-Windows-DotNETRuntime/GC/Start
+Microsoft-Windows-DotNETRuntime/GC/Stop
+Microsoft-Windows-DotNETRuntime/GC/RestartEEStart
+Microsoft-Windows-DotNETRuntime/GC/RestartEEStop
+```
+
+(you can see these in the Events view)
+
+In a typical blocking GC (this means all ephemeral GCs and full blocking GCs) the event sequence is very simple:
+
+```
+GC/SuspendEEStart
+GC/SuspendEEEnd <– suspension is done
+GC/Start 
+GC/End <– actual GC is done 
+GC/RestartEEStart
+GC/RestartEEEnd <– resumption is done.
+```
+
+GC/SuspendEEStart and GC/SuspendEEEnd are for suspension; and GC/RestartStart and GC/RestartEEEnd are for resumption. Resumption takes very little time so we don’t need to discuss it. Suspension is what might take long.
+
+A BGC is much more complicated, a full BGC event sequence looks like this -
+
+```
+1) GC/SuspendEEStart
+2) GC/SuspendEEStop
+3) GC/Start <– BGC/ starts
+
+<- there might be an ephemeral GC happen here, if so you'd see
+GC/Start
+GC/Stop
+
+4) GC/RestartEEStart
+5) GC/RestartEEStop <– done with the initial suspension
+
+<- there might be 0 or more foreground ephemeral GC/s here, an example would be
+GC/SuspendEEStart
+GC/SuspendEEStop
+GC/Start
+GC/Stop
+GC/RestartEEStart
+GC/RestartEEStop
+
+6) GC/SuspendEEStart
+7) GC/SuspendEEStop 
+8) GC/RestartEEStart 
+9) GC/RestartEEStop <– done with BGC/'s 2nd suspension
+
+<- there might be 0 or more foreground ephemeral GC/s here
+
+10) GC/Stop <– BGC/ Stops
+```
+
+So BGC has a second Suspend/Restart pair in the middle of it. Currently in the GCStats view we actually combine the 2 pauses (I’m planning to separate them) but you can always use the Events view to figure out which pause is long if you do see a long BGC pause. In the following example I’ve copied and pasted from the Events view an event sequence from a customer’s trace that hit the [runtime bug](#Long-pause-due-to-bugs) I mentioned –
+
+| **Event  Name**   | **Time  MSec** | **Reason**       | **Count** | **Depth** | **Type**        | **explanation**                                              |
+| ----------------- | -------------- | ---------------- | --------- | --------- | --------------- | ------------------------------------------------------------ |
+| GC/Start          | 160,551.74     | AllocSmall       | 188       | 2         | BackgroundGC    |                                                              |
+| GC/Start          | 160,551.89     | AllocSmall       | 189       | 0         | NonConcurrentGC | We are doing a gen0 at the  beginning of this BGC            |
+| GC/Stop           | **160,577.48** |                  | 189       | 0         |                 |                                                              |
+| GC/RestartEEStart | **160,799.87** |                  |           |           |                 | **There's a long period of time  here between last event and this one due to the bug** |
+| GC/RestartEEStop  | 160,799.91     |                  |           |           |                 |                                                              |
+| GC/SuspendEEStart | 161,803.36     | SuspendForGC     | 188       |           |                 | A Foreground gen1 happens                                    |
+| GC/SuspendEEStop  | 161,803.42     |                  |           |           |                 |                                                              |
+| GC/Start          | 161,803.61     | AllocSmall       | 190       | 1         | ForegroundGC    |                                                              |
+| GC/Stop           | 161,847.14     |                  | 190       | 1         |                 |                                                              |
+| GC/RestartEEStart | 161,847.15     |                  |           |           |                 |                                                              |
+| GC/RestartEEStop  | 161,847.23     |                  |           |           |                 | The Foreground gen1 ends                                     |
+| GC/SuspendEEStart | **161,988.57** | SuspendForGCPrep | 188       |           |                 | BGC's 2nd suspension starts with  SuspendForGCPrep as its reason |
+| GC/SuspendEEStop  | 161,988.71     |                  |           |           |                 |                                                              |
+| GC/RestartEEStart | 162,239.84     |                  |           |           |                 |                                                              |
+| GC/RestartEEStop  | **162,239.94** |                  |           |           |                 | **BGC's 2nd suspension ends,  another long pause due to the same bug** |
+| GC/Stop           | 162,413.70     |                  | 188       | 2         |                 |                                                              |
+
+ 
+
+What I did was looking up the time ranges for those long pauses (**160,577.482**-**160,799.868** and **161,988.57**-**162,239.94**) in the CPU stacks view which revealed the bug. 
+
+###### PerfView GC stop triggers
+
+There are 3 GC specific stop triggers –
+
+| **Trigger name**            | **What it measures**                                         |
+| --------------------------- | ------------------------------------------------------------ |
+| StopOnGCOverMsec            | trigger if the time between  GC/Start and GC/Stop is over this value, and it's not a BGC |
+| StopOnGCSuspendOverMSec     | trigger if the time between  GC/SuspendEEStart and GC/SuspendEEStop is over this value |
+| StopOnBGCFinalPauseOverMSec | trigger if the time between  GC/SuspendEEStart (with Reason SuspendForGCPrep) and GC/RestartEEStop is over  this value |
+
+The commandlines I usually use with /StopOnGCOverMSec and /StopOnBGCFinalPauseOverMSec are –
+
+`PerfView.exe /nogui /accepteula /StopOnGCOverMSec:15 /Process:A /DelayAfterTriggerSec:0 /CollectMultiple:3 /KernelEvents=default /ClrEvents:GC+Stack /BufferSize:3000 /CircularMB:3000 /Merge:TRUE /ZIP:True collect`
+
+If your process is called A.exe, you’d want to specify /Process:A. Change 15 to whatever value suits the problem you are debugging. I have a detailed explanation of each arg in [this blog entry](https://devblogs.microsoft.com/dotnet/you-should-never-see-this-callstack-in-production/). 
+
+##### Debugging a random long GC
+
+Here's an example that demonstrates how to debug a GC that suddenly takes much longer than other GCs that promoted a similar amount. I've collected a trace with the above commandline and I can see in GCStats there's a GC longer than 15 - it's GC#4022 which is 20.963 ms and it didn't promoted anymore than normal (you can see the gen0 right above it that promoted very similar amounts yet took a lot less time). 
+
+<img src=".\long-server-gc.jpg" alt="Long Server GC" style="zoom:80%;" >
+
+So I enter GC#4022's start and end timestamp in the CPU stack view (30,633.741 to 30,654.704) and I see that for the coreclr!SVR::gc_heap::gc_thread_function which performs the actual GC work, there's 2 parts with no CPU usage when there should be plenty - the ____ parts mean no CPU usage. 
+
+<img src=".\missing-cpu.jpg" alt="Missing CPU in Server GC" style="zoom:80%;" >
+
+So we can highlight the first flat part in the CPU Stacks view, right click on it and select "Set time range". This will show us the CPU samples for this process during this time, and of course we will see none. Now let's clear the process name from IncPats so it would show us the CPU usage from all processes that had CPU usage during this time range -
+
+<img src=".\interfering-cpu.jpg" alt="Interfering CPU in Server GC" style="zoom:80%;" >
+
+We see the mpengine module which is from the MsMpEng.exe process (double clicking on the mpengine cell will tell you which process it belongs to). To confirm this process is interfering with our process is to enter the start and end timestamp in the Events and look at the raw CPU sample events (if you don't know how to use this view, see the [Other relevant views in PerfView](#Other-relevant-views-in-PerfView) section) -
+
+<img src=".\interfering-cpu-raw-events.jpg" alt="Interfering CPU" style="zoom:80%;" >
+
+you can see the priority of the samples from the MsMpEng.exe process is very high - 15. The Server GC threads run at around priority 11.
+
+For debugging long suspension, I usually take a ThreadTime trace which includes ContextSwitch and ReadyThread events – they are voluminous but should tell us exactly what the GC thread is waiting on when it calls SuspendEE –
+
+`PerfView.exe /nogui /accepteula /StopOnGCSuspendOverMSec:200 /Process:A /DelayAfterTriggerSec:0 /CollectMultiple:3 /KernelEvents=ThreadTime /ClrEvents:GC+Stack /BufferSize:3000 /CircularMB:3000 /Merge:TRUE /ZIP:True collect`
+
+However, ThreadTime traces can be too voluminous and might cause your application to not run "normal" enough to exhibit the behavior you were debugging. In that case I would take a trace with default kernel events to begin with which often would either reveal the problem or give you enough clues. You can simply replace ThreadTime with Default -
+
+`PerfView.exe /nogui /accepteula /StopOnGCSuspendOverMSec:200 /Process:A /DelayAfterTriggerSec:0 /CollectMultiple:3 /KernelEvents=Default /ClrEvents:GC+Stack /BufferSize:3000 /CircularMB:3000 /Merge:TRUE /ZIP:True collect`
+
+I have a detailed example of debugging a long suspension issue in [this blog entry](https://devblogs.microsoft.com/dotnet/work-flow-of-diagnosing-memory-performance-issues-part-2/).
+
+#### **Large GC heap size**
+
+If you don't know how to collect GC heap size data, please follow instructions in ["How to collect top level GC metrics"](#How-to-collect-top-level-GC-metrics)
+
+- #### Debugging OOM
+
+Before we talk about large GC heap size as a general problem category I'd like to mention debugging OOM specifically as this is an exception that most readers are familiar with. And some folks might have used the SoS !AnalyzeOOM command which would show you 2 things - 1) if there is indeed a managed OOM.  Because [GC heap is only one kind of memory usage in your process](#GC-heap-is-only-one-kind-of-memory-usage-in-your-process), the OOM is not necessarily due to the GC heap; 2) if it's a managed OOM, [what operation caused it](https://github.com/dotnet/diagnostics/blob/master/src/SOS/Strike/strike.cpp#L5088), e.g., GC tried to reserve a new segment but couldn't (you'll never really see this on 64-bit) or couldn't commit when trying to do an allocation.
+
+Without using SoS, you can also verify whether the GC heap is the culprit of the OOM by simply looking at how much memory it uses vs. how much memory the process uses. We will talk about profiling the heap size below. If you verify that the GC heap takes the majority of the memory usage, and since we know that OOM is only thrown after GC [tried very hard to reduce the heap size but couldn't](#When-would-GC-throw-an-OOM-exception), it means there's simply a lot of memory that survived due to [user roots](#2-User-roots) which means GC couldn't reclaim it. And you can follow the [managed memory leak investigation](#First-of-all-do-you-have-a-managed-memory-leak) to figure out what survived.
+
+Now let's talk about the situation where you are not getting OOM but need to look at the heap size to see whether or how you can optimize it. In the “[How to look at the GC heap size properly](#How-to-look-at-the-GC-heap-size-properly)” section we talked about heap size and how to measure extensively. So we know that the heap size heavily depends on when you measure wrt when GCs happen and the allocation budgets. The GCStats view shows you the size on entry and on exit on a GC, ie, Peak and After –
+
+<img src=".\HeapSize.jpg" alt="HeapSize" style="zoom:80%;" />
+
+It helps to dissect the sizes a bit. The After MB column is the sum of 
+
+Gen0 MB + Gen1 MB + Gen2 MB + LOH MB
+
+Also notice that Gen0 Frag % says 99.99%. We know this is due to [pinning](#Pinning). So part of the gen0 allocations will fit into this fragmentation. So for GC #2, it started with 26.497 MB at the end of GC #1, then allocated 101.04 MB and ended with a size of 108.659 MB when GC #2 started.
+
+To figure out whether the GC heap size is *too large*, we should look at the following factors –
+
+- #### **Is the Peak size too large but the After size is not?** 
+
+If this is the case, it generally means there’s too much gen0 allocation before the next GC is triggered. In .NET Core 3.0 we enabled a config to limit this called GCGen0MaxBudget - I don't usually advise to folks to set this because you might set it too small which would trigger GCs too often. This is to limit the maximum gen0 allocation budget. When you are using [Server GC](#Server-GC), GC is quite aggressive at setting the gen0 budget as it thinks it's fine for the process to use a lot of resources on the machine. And this is usually ok because if a process uses Server GC it often means it can afford to use a lot of resources. But if you do have a situation where you are fine with triggering GCs more often to exchange to a smaller heap size, you can do so with this config. My hope is in the future we would make this part of some high level config that allows you to communicate to us that you'd like to make this trade off so GC can adjust this automatically for you, instead of your using a very low level config yourself.
+
+Folks who used the GC performance counters in the old days recognize the "#Total Committed Bytes" counter and they've asked how to get this in .NET Core. First of all, if you were measuring committed bytes this way, you might see it much closer to the Peak Size instead of the After size due to the [special handling of committed on the ephemeral segment](#Special-handling-of-the-ephemeral-segment). Because "After size" is not reporting the gen0 budget part that we will be using but haven't used yet. So you could just use Peak Size reported in GCStats as your approximate total committed. But if you are using .NET 5, you can get this number by calling the [GetGCMemoryInfo](#How-to-collect-top-level-GC-metrics) API we mentioned earlier - it's one of the properties returned on the GCMemoryInfo struct. 
+
+There is a less convenient way which is the [ExtraGen0Commit](https://github.com/microsoft/perfview/blob/master/src/TraceEvent/Parsers/ClrTraceEventParser.cs#L5131) field in the [per heap history event](#https://github.com/microsoft/perfview/blob/master/src/TraceEvent/Parsers/ClrTraceEventParser.cs#L4773). You can add this (if you are using Server GC it would be the sum of all heaps' ExtraGen0Commit) on top of the heap size info you already get (ie, on the [GCHeapStats](https://docs.microsoft.com/en-us/dotnet/framework/performance/garbage-collection-etw-events#gcheapstats_v2-event) event). But we don't expose this in the UI in PerfView so you'd need to consume the [TraceEvent](#https://github.com/microsoft/perfview/tree/master/src/TraceEvent) library yourself to get to this.
+
+- #### **Is the After size too large?**
+
+If so, is most of the size in gen2/LOH? Are you doing BGCs (which don’t compact) mostly? If you are already doing full blocking GCs and the After size is still too large, it simply means you have too much data survived. You can follow the [managed memory leak investigation](#First-of-all-do-you-have-a-managed-memory-leak) to figure out what survived.
+
+Another possible scenario is a big percentage of the heap is in gen0 but it’s mostly fragmentation. This will happen especially if you pin some objects for a long time and they are scattered enough on the heap. So even though GC has [demoted](#pinning) them to gen0, as long as those pins aren’t going away, that part of the heap still cannot be reclaimed. You can collect [GCHandle](https://devblogs.microsoft.com/dotnet/gc-handles/) events to figure out when they get pinned. The PerfView commandline is
+
+`perfview /nogui /KernelEvents=Process+Thread+ImageLoad /ClrEvents:GC+Stack+GCHandle /clrEventLevel=Informational collect`
+
+The Pinned Stacks view in Advanced Group will light up that shows you when pinned handles start pointing to objects and when they get destroyed –
+
+<img src=".\PinningStack.jpg" alt="PinningStack" style="zoom:80%;" />
+
+- #### **Are you doing mostly BGCs for gen2 GCs?**
+
+If you are mostly doing BGCs, is the fragmentation used effectively, i.e., when the BGC starts, is gen2 Frag % very large? If it’s not very large it means it works optimally. Otherwise this indicates a BGC scheduling problem – please let me know about it. To look at the fragmentation at the beginning of a BGC, you can use the Raw XML link in the GCStats view to look at it. I've trimmed down the data to only the relevant parts -
+
+```
+<GCEvent GCNumber=  "1174" GCGeneration="2" Type= "BackgroundGC" Reason= "AllocSmall">
+  <PerHeapHistory>
+    <GenData Name="Gen2" SizeBefore="187,338,680" SizeAfter="187,338,680" ObjSpaceBefore="177,064,416" FreeListSpaceBefore="10,200,120" FreeObjSpaceBefore="74,144"/>
+    <GenData Name="GenLargeObj" SizeBefore="134,424,656" SizeAfter="131,069,928" ObjSpaceBefore="132,977,592" FreeListSpaceBefore="1,435,640" FreeObjSpaceBefore="11,424"/>
+```
+
+SizeBefore = ObjSpaceBefore + FreeListSpaceBefore + FreeObjSpaceBefore
+
+`SizeBefore` the total size of the generation. 
+
+`ObjSpaceBefore` the size taken up by valid objects in this generation
+
+`FreeListSpaceBefore` the size taken up by the free list in this generation
+
+`FreeObjSpaceBefore` the size taken up by free objects too small to go on the free list in this generation
+
+(FreeListSpaceBefore + FreeObjSpaceBefore) is what we call the fragmentation.
+
+In this case we see that ((FreeListSpaceBefore + FreeObjSpaceBefore) / SizeBefore) is 5%, that's quite small which means we've used up most of the free space BGC built up well. Of course we'd like to see this ratio as small as possible but if the free spaces are too small it means GC might not be able to use them. In general I wouldn't worry about it if this is 15% or smaller unless we see that the free spaces are large enough but aren't getting used.
+
+You can also get this data from the [GetGCMemoryInfo](#How-to-collect-top-level-GC-metrics) API we mentioned earlier. 
+
+- #### **Are you seeing a heap size that makes sense from GC’s POV, but still wanting to have a smaller heap?**
+
+After you’ve gone through the above, you may discover that this is all explainable from GC’s POV. But what if you still want the heap size to be smaller? 
+
+You could put your process in a memory constrained environment, i.e., a container with a memory limit which means GC will automatically recognize that as the memory it can use. However if you are using Server GC you would want to upgrade to at least .NET Core 3.0 which made the container support a lot more robust. In that release we also added 2 new configs that allow you specify the memory limit for the GC heap – [GCHeapHardLimit and GCHeapHardLimitPercent](https://docs.microsoft.com/en-us/dotnet/core/run-time-config/garbage-collector#heap-limit). They are explained in [this blog entry](https://devblogs.microsoft.com/dotnet/running-with-server-gc-in-a-small-container-scenario-part-1-hard-limit-for-the-gc-heap/). 
+
+When your process runs on a machine with other processes, the default memory load where GC starts to react may not be desirable for every process. You could consider using the [GCHighMemPercent](https://docs.microsoft.com/en-us/dotnet/core/run-time-config/garbage-collector#high-memory-percent) config and set that threshold lower - this will make GC be more aggressive about doing full blocking GCs so it will not grow your heap as much even when there’s memory available. 
+
+- #### Is GC using too much memory for its own bookkeeping?
+
+Very occasionally I've had reports from folks where they did observe a big chunk of memory was used for the GC bookkeeping. You can see it by the VirtualAlloc call made by GC's `gc_heap::grow_brick_card_tables`. This is because the heap range was stretched so far due to some unexpected regions being reserved in the address space. If you do hit this problem and can't prevent the unexpected reserve, you might consider specifying a memory limit with [GCHeapHardLimit/GCHeapHardLimitPercent](https://docs.microsoft.com/en-us/dotnet/core/run-time-config/garbage-collector#heap-limit), then the whole limit will be reserved up front so you will not run into this problem.
+
+## **Definitive signs of perf problems**
+If you are seeing any of the following, there's no question you have perf problems. As with any perf problems, it's always important to prioritize correctly. For example, you could have very long GC pauses but if they don't affect the perf metrics you care about, it'd be more productive for you to spend your time elsewhere. 
+
+I'm using the GCStats view in PerfView to show the symptoms. If you are not familiar with this view, please see [this section](#displaying-top-level-gc-metrics). You don't have to use PerfView; it's fine to use whatever tool as long as it's capable of showing the data below.
+
+#### Suspension is too long
+
+Suspension normally takes way less than 1ms each time it happens. If you are seeing something that's in the 10s or 100s of ms, you don't need to wonder if you have a perf problem - it's a definitive sign that says you do. 
+
+If you are seeing that most of your GC pauses are taken up by suspension, especially consistently, and your total GC pause is too much, you should definitely debug it. I have a detailed example of debugging a long suspension issue in [this blog entry](https://devblogs.microsoft.com/dotnet/work-flow-of-diagnosing-memory-performance-issues-part-2/).
+
+This is indicated by the "Suspend Msec" and the "Pause Msec" column in the GCStats view. I've mocked up an example -
+
+| GC Index | Suspend Msec | Pause Msec |
+| -------- | ------------ | ---------- |
+| 10       | 150          | 180        |
+| 11       | 190          | 200        |
+
+Both GCs spent most of their pause time in suspension.
+
+#### Random long GC pauses
+
+"Random long GC pauses" means suddenly you are seeing that a GC doesn't promote more than usual yet takes much longer. Here's a mocked up example -
+
+| GC Index | Suspend Msec | Pause Msec | Promoted MB |
+| -------- | ------------ | ---------- | ----------- |
+| 10       | 0.01         | 5          | 2.0         |
+| 11       | 0.01         | 200        | 2.1         |
+| 12       | 0.01         | 6          | 2.2         |
+
+All GCs promoted ~2MB/each but GC#10 and #12 took a few ms while GC#11 took 200. That's an indication that something went wrong during GC#11. Sometimes you might see the GC that suddenly takes very long also incurred a very long suspension because the same reasons that caused the long suspension also affected the GC work. 
+
+I've given an example [above](#debugging-a-random-long-gc) how to debug this issue.
+
+#### Most GCs are full blocking GCs
+
+If you are seeing most GCs happening are full blocking, which usually takes quite a while if you have a large heap, that's a perf problem right there. We shouldn't be doing full blocking GCs all the time, period. Even if you are in [high memory load](#GC-is-per-process-but-is-aware-of-physical-memory-load-on-the-machine) situation, the purpose of doing a full blocking GC is to reduce the heap size so the memory load is no longer high. And GC has ways to combat when there's a challenging scenario such as the [provisional mode](https://devblogs.microsoft.com/dotnet/provisional-mode/) for high memory load + heavy pinning to avoid doing more full blocking GCs than necessary. The most common cause for this that I've seen is actually induced full blocking GCs which is trivial to debug because the GCStats would show you the trigger reason is Induced. Here's a mocked up example -
+
+| GC Index | Trigger Reason | Gen  | Pause Msec |
+| -------- | -------------- | ---- | ---------- |
+| 10       | Induced        | 2NI  | 1000       |
+| 11       | Induced        | 2NI  | 1100       |
+| 12       | Induced        | 2NI  | 1000       |
+
+[This section](#how-to-see-why-a-gc-decided-to-collect-a-generation) talks about how to find out what induced GCs.
+
+## Helpful info for us to help you debug perf issues
+
+At some point, after you have followed the advice in this doc and done the due diligence, you still find your perf problems not solved. We'd love to help! To save time for both you and us, we recommend to have the following info -
+
+#### File version of the runtime
+
+There are always new GC changes with every release so it's only natural that we'd want to know exactly which version of the runtime you are using so we know what GC changes are in that version of the runtime. So it's essential to provide this info. How the version is mapped to the "public name" like .NET 4.7 is not easily trackable so it would help us a lot to provide the "FileVersion" attribute of the dll which either tells us the version number with the branch name (for .NET Framework) or the actual commit (for .NET Core). You can get this info by either a powershell command like this:
+
+```PowerShell
+PS C:\Windows\Microsoft.NET\Framework64\v4.0.30319> (Get-Item C:\Windows\Microsoft.NET\Framework64\v4.0.30319\clr.dll).VersionInfo.FileVersion
+4.8.4250.0 built by: NET48REL1LAST_C
+
+PS C:\> (Get-Item C:\temp\coreclr.dll).VersionInfo.FileVersion
+42,42,42,42424 @Commit: a545d13cef55534995115eb5f761fd0cecf66fc1
+```
+
+Another way to get this info is via the debugger via the lmvm command (parts are omitted) -
+
+```
+0:000> lmvm coreclr
+Browse full module list
+start             end                 module name
+00007ff8`f1ec0000 00007ff8`f4397000   CoreCLR    (deferred)             
+    Image path: C:\runtime-reg\artifacts\tests\coreclr\windows.x64.Debug\Tests\Core_Root\CoreCLR.dll
+    Image name: CoreCLR.dll
+    Information from resource tables:
+        FileVersion:      42,42,42,42424 @Commit: a545d13cef55534995115eb5f761fd0cecf66fc1
+```
+
+You could also find the `KernelTraceControl/ImageID/FileVersion` event if you capture an ETW trace. It looks like this (parts are omitted):
+
+```
+ThreadID="-1" ProcessorNumber="2" ImageSize="10,412,032" TimeDateStamp="1,565,068,727" BuildTime="8/5/2019 10:18:47 PM" OrigFileName="clr.dll" FileVersion="4.7.3468.0 built by: NET472REL1LAST_C"
+```
+Note that this event may not be present in your trace though. So even if you provided us with a trace it would be best to provide the version info to use anyway, in case this is not captured by the trace. These days we are very likely in different timezones. So instead of us asking you for this info and your responding which might take another day or two, it's more efficient to provide the info when you ask for help.
+
+#### What diagnostics you have already performed
+
+If you have followed the techniques in this doc and done some diagnostics on your own, which is highly recommended, please do share with us what you have done and what conclusion you arrived at. Not only does this save us work, it also tells us how the info we provided helped or didn't help with your diagnostics so we can make adjustments on the info we provide to our customers to make their lives easier.
+
+#### Perf data
+
+As with any perf problems, without any perf data we can really only give some general guidelines and suggestions. To actually pinpoint the problem we need perf data.
+
+As mentioned numerous times in this doc, perf traces are the main method via which we debug perf problems and unless you already performed diagnostics to indicate that a top level GC trace isn't necessary we'd always ask you to [collect such a trace](#how-to-collect-top-level-gc-metrics) to begin with. I usually also ask for a trace with CPU samples, especially if we want to look at the GC work in detail. The commandline is -
+
+`PerfView /nogui /KernelEvents=Process+Thread+ImageLoad+Profile /ClrEvents:GC+Stack /clrEventLevel=Informational /BufferSize:3000 /CircularMB:3000 /MaxCollectSec:600 collect gc-with-cpu.etl`
+
+This will collect for 10 minutes. It will not contain enough info to decode managed frames but it's fine for looking at work the GC does.
+
+We might ask you to collect additional traces based on the clues we get from the initial traces. 
+
+In general dumps are not great for investigating performance problems. However we understand that sometimes traces may not be available and all you have is dumps. If that's the case obviously do share them with us if you can (ie, no privacy concerns), and please do make sure that we have access to them.
+
+## FAQ
+
+#### FAQ #1 
+
+#### "I didn't change my code at all, why am I seeing a regression in memory when I upgrade my .NET version?"
+
+A similar (and more premature) question often asked is -
+
+"What GC changes caused the regression in memory I'm seeing when I upgrade .NET?"
+
+The answer to this question is "it's not necessarily due to changes in GC at all". 2 essential things to understand -
+
+- GC is a component that the runtime provides to manage memory for you. So if the allocations you are asking for and/or how these allocations survived change, GC behavior will change accordingly.
+
+- Your process doesn't run just your code, it includes your code and whatever libraries you are using. In fact, for most users, the code they write is a small part of what gets run. And between 2 different versions of .NET, the library code also changes, in addition to the runtime code (which includes the GC). Between 2 major versions of .NET, you can bet there's a *huge* amount of changes in the libraries as well as in the runtime and those can very well change the allocation/survival patterns. 
+
+Obviously, changes in GC can also cause memory behavior changes. But changes in the library code you are calling can contribute to the changes in memory behavior just as easily. 
+
+If you are seeing a larger heap size, and if full blocking GCs are happening (either by your inducing such GCs, something doing that on your behalf, or they naturally happens), it means the heap size is at the smallest possible and GC cannot reclaim any more memory. Whatever is left on the heap is purely due to the application holding onto it. And if you are still seeing a larger heap size, it means you or the libraries you are using are simply holding onto more memory. You can check this by capturing a trace with [top level GC metrics](#How-to-collect-top-level-GC-metrics), and see if you have GCs that are marked as **2N** which means it's a full GC ('2)' and it's blocking ('N'). The example below shows that it's also an *induced* full blocking GC ('I') -
+
+<img src=".\FullBlockingGC.jpg" alt="FullBlockingGC" style="zoom:80%;" />
+
+If there's no 2N GCs happening, or if the regression is not about heap sizes, the easiest way to *start* the analysis for this kind of regressions is to see if you are doing more allocations. This info can be obtained by various techniques explained in the [Measure allocations](#Measure-allocations) section. Sometimes the allocations are not the problem, it's the survival pattern which would require more in-depth analysis, in which case I would suggest to start by collecting a trace that includes the [top level GC metrics](#How-to-collect-top-level-GC-metrics) on both the old and the new version and checking the differences between them to see what category of problems it shows. Then you can follow what's described above in this doc to diagnose them. Keep in mind when you have both libraries and the runtime changes it may not be trivial at all to figure out what causes the behavior change, due to the sheer amount of changes.
+
+In order to combat this issue, starting .NET 6, we've been much more mindful about keeping backward compatibility of the interface between the GC and the rest of the runtime so we can try with just changes in GC instead of everything changing when you upgrade your version of .NET. The best thing would be to use a standalone GC dll which means only the GC changes are in effect and we can see if you are still seeing the regression. The next best thing is to replace just coreclr.dll. This way we can isolate runtime changes from the libraries changes. When you get to the system.private.corelib.dll layer usually the bets are off because the interface between it and the higher level libraries would change dramatically from release to release. 
+
+#### FAQ #2
+
+#### Why isn't the GC collecting these objects? They should be collected!
+
+It's all too often that folks complain the GC isn't collecting their objects when GC by design shouldn't. As I mentioned at the beginning of this doc, knowing a few fundamentals really helps. A fundamental piece of knowledge that's very helpful to understanding this kind of issues is -
+
+*when a full blocking GC happens, GC does NOT participant in determining object lifetime. What this means is if an object remains on the heap, it means it must be held live by [user roots](#2-User-roots). In other words, either your code or the library code you are calling is holding it alive and GC must not collect it (if it did it would be a functional bug in the GC).*
+
+For example, if you have a strong handle pointing at an object and you are not calling free on the handle, you are telling the GC it cannot collect this object because it's in use. I've had folks who were trying to solve fragmentation problems while knowingly had a bunch of async pinned handles holding onto objects, and async pinned handles are strong handles.
+
+Below are some of the most commonly asked questions that I've come across -
+
+
++ **"our GC heap has grown very big, and we have induced a GC or observed blocking gen2 GCs, and the heap is still very big. How come?"**.  
+
+I've also come across customers who thought they induced a GC but didn't actually due to some user error. If possible, I would strongly suggest to *verify* that you actually did induce a GC in the process by collecting [a top level GC trace](#How-to-collect-top-level-GC-metrics). 
+
+After a full blocking GC, you can observe one of the 2 scenarios -
+
+-The fragmentation ratio is big on the heap which means you have a lot of free spaces on the heap. This is because you have pinning that GC cannot move. Some folks also want to make sure that the LOH is also compacted and induce a GC like this -
+
+```csharp
+GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+GC.Collect(2, GCCollectionMode.Forced, true, true);
+```
+
+which will make LOH is compacted. So if after this you still have a lot of free spaces, it means you need to look into what caused these pins to exist. I talked about how to diagnose this in the [Is the After size too large?](#Is-the-After-size-too-large) section.
+
+-The fragmentation ratio is small on the heap which means you simply have a lot of objects held live and GC cannot possibly get rid of them. How to diagnose this is described in the [do you have a managed memory leak?](#First-of-all-do-you-have-a-managed-memory-leak) section.
+
++ Another seeming different question (but really is the same as the last one) is **"We saw multiple full blocking GCs and the heap size didn't go down during the first few of them, but did go down during the last one. Why didn't GC work fast enough during the first few GCs?"**
+
+Again, using the fundamental piece of knowledge mentioned at the beginning of this FAQ, this simply means during the first few times when a collection happened, something was holding onto the objects survived at the end of those GCs but that something no long held those objects live during the last GC. Remember, GC just gets told which objects should be live in a full blocking GC. So it's not that GC "didn't work fast enough", it's just because at that time, those objects were still held live so GC couldn't get rid of them by design.
+
+A cause for this could be due finalization. When a finalizable object dies, it gets promoted so its finalizer can run. This is explained in the [Finalizers](#Finalizers) section. If your finalizable object holds onto other managed objects, it means those objects can only be collected when the finalizable objects are collected. If for some reason those finalizers didn't run fast enough it means the next GC they are  still live.
+
++ This is a typical example of a super simple test that folks kept asking about - **"I can see object o is no longer used when I called GC.Collect, why isn't GC collecting it?"** -
+
+```csharp
+public static int Main()
+{
+    MyType o = new MyType(128, 256);
+
+    // Create a weak handle that points to the object so it should not affect the object lifetime
+    GCHandle h = GCHandle.Alloc(o, GCHandleType.Weak);
+
+    // It *looks* like o is not used anymore so if we call Collect() here it should be collected,
+    // right?
+    GC.Collect();
+
+    // No! This outputs 
+    // Collect called, h.Target is not collected
+    Console.WriteLine("Collect called, h.Target is {0}", 
+                      (h.Target == null) ? "collected" : "not collected");
+
+    return 0;
+}
+```
+
+This is because when JIT generates code for you, it's free to lengthen the lifetime till end of the method. So in this case JIT simply extended the lifetime of o till the end of the `Main` method so GC.Collect(), which induces a full blocking GC, cannot collect o. In order to avoid this, you can put the usage of o in its own method and disable inlining -
+
+```csharp
+[MethodImpl(MethodImplOptions.NoInlining)]
+public static void TestLifeTime()
+{
+    MyType o = new MyType(128, 256);
+    h = GCHandle.Alloc(o, GCHandleType.Weak);
+}
+
+public static int Main()
+{
+    TestLifeTime();
+    GC.Collect();
+    // This outputs
+    // Collect called, h.Target is collected
+    Console.WriteLine("Collect called, h.Target is {0}",
+            (h.Target == null) ? "collected" : "not collected");
+
+    return 0;
+}
+```
+
+#### FAQ #3
+
+#### Why do *I* need to care about the OS differences at all? .NET is cross-plat so it should take care of that for me!
+
+While we obviously strive to abstract away the OS differences as much as we can so our customers don't need to worry about them for the most part, it does not mean the behavior is absolutely the same all the time. There will be times when some detailed OS difference will come into play. One time I had a customer who encountered much worse perf on Linux than on Windows and it turned out that because on Linux directory names are case sensitive which caused a method they had that compared the directory names to create new objects while on Windows it doesn't because it's case insensitive. So they ended up doing 10x more allocations on Linux.
+
+Another source of differences between OSs is some may not support the features the runtime needs, or some OS APIs simply have different behavior. Again we are trying to abstract these away but some aren't practical to be abstracted away. And again, the best way is always to capture some perf data and investigate to see what differences show up.
+
+#### FAQ #4
+
+#### We are collecting the % time in GC counter and it's telling us it's 99%. How do we fix our perf problem?
+
+Somehow many folks misinterpret the meaning of this counter despite its accurate description in the tooling doc. This is the description from .NET Framework -
+
+"% Time in GC is the percentage of elapsed time that was spent in performing a garbage collection (GC) since the last GC cycle. This counter is usually an indicator of the work done by the Garbage Collector on behalf of the application to collect and compact memory. This counter is updated only at the end of every GC and the counter value reflects the last observed value; its not an average."
+
+(You can see this when you click the "Show description" checkbox for this counter in perfmon)
+
+And for .NET core, [the doc page](https://docs.microsoft.com/en-us/dotnet/core/diagnostics/available-counters) says the name of the counter is "% Time in GC since last GC" and the description is "The percent of time in GC since the last GC". 
+
+So both documentation says it's the % time in GC *since the last GC*, *not an average*. And if the last GC happened to be an expensive GC, it means this counter's value is going to be very high if you happen to sample right after this GC. Let's say you did a GC once every 1s, and you also happen to sample exactly in-between each GC, viola! Your sampling represents the reality perfectly. But the caveat of sampling is this may not be the case at all, depending on how often you sample wrt when the thing you are sampling happens, and what the counter is measuring. So imagine you sampled once every 10 minutes (which is completely normal), for this particular counter it could vastly misrepresent the reality. Let's say you happen to sample right after an expensive GC which says the % time in GC is 99% and for the next 10 mins it'll remain 99% because well, you haven't gotten your next sampled value yet. Some people will interpret that their "perf problem" is lasting for 10mins which is most likely completely untrue. 
+
+Instead of trying to explain things via docs (and not succeeding at it, since I've had to explain this to many, many people), I decided we should simply provide a better/more practical/more useful counter. So I've filed [this issue](https://github.com/dotnet/runtime/issues/69324) to provide a new counter that reflects the accumulative % time in GC. Before this counter is provided, you could do the following -
+
++ capture an event trace with [top level GC metrics](#How-to-collect-top-level-GC-metrics)
++ sample more often (I'm in general just not a fan of counters but I get their simplicity which makes them attractive for general monitoring (without providing much, if anything at all, to diagnose the actual problem)); of course this could mean you'll need a lot more space to store the counter values if you require them to be stored.
+
+#### FAQ #5
+
+#### What's the most efficient way for me to get help from you?
+
+I confess this is actually not a FAQ, but I really wish it was one. All too often I see folks needing help aren't being very productive at allowing others (who are very willing to help) to provide help. This saddens me so I wanted to take this opportunity to talk about it.
+
++ Save time for others. Sometimes I'm looped in on a very long email thread with no explanation whatsoever what the problem actually is. When I see folks who summarizes the problem in a few sentences I'm always appreciative because it saves me a lot of time to scan through many emails. 
+
+Note that summarizing the problem for others is always a great way to help others help you. One of my coworkers who's a master at debugging also always writes these awesome emails to explain the problems he debugged and his format is to summarizer the problem, the root cause and possible workarounds in a few sentences; then there's a "details" section that you could totally read if you are interested in a much more detailed description of how he found the problem but could also skip if you only need to know how to fix the problem.
+
++ Provide helpful info for us to help you - this is described in the [helpful info for us to help you](#helpful-info-for-us-to-help-you-debug-perf-issues) section. To reiterate -
+
+-A dump is often not a good thing to help diagnose memory problems. And a dump that we don't have permission to look at is not helpful at all (this has happened quite a few times internally where inspecting dumps required special permission that we did not have; this means there's really nothing we could do there assuming you do not provide us with any other data).
+
+-Do a sanity check on the trace to make sure it captures what you wanted to capture. I came across folks who shared traces that were not the scenario they wanted to capture, didn't contained any useful info, or didn't contain the events we specifically requested. This doesn't just save time for us, it can also allow us you help quicker. Nowadays we often work with folks in very different time zones. And asking for clarification may mean it takes one more day before we can provide help for you. This is especially critical if you urgently need help.
+
++ Do check the already available resources - msdn docs, blogs and articles like this one. I always appreciate it very much when folks show me the data they collected and the analysis they already did on that data. It makes me a little sad to see folks whose jobs are to fix perf problems don't show any interest in actually looking at the data we asked them to collect. On the other hand, it always makes me happy when someone shows interest to learn how to diagnose problems themselves.
