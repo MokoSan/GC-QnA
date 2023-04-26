@@ -2,4 +2,3 @@ Flask
 langchain
 openai
 chromadb
-tiktoken
